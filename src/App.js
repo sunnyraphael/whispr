@@ -1076,17 +1076,17 @@ function CommentSection({ postId, currentUser, bannedWords }) {
     setLoading(true);
     try {
       const comment = { commentId: `c_${Date.now()}`, postId, parentId: parentId || null, username: currentUser.username, uid: currentUser.uid, text: text.trim(), createdAt: serverTimestamp(), likes: 0, likedBy: [] };
-      await addDoc(collection(db, "comments"), comment);
-      // Write lastCommentAt so Firestore 30s rate-limit rule works
+      const commentDoc = await addDoc(collection(db, "comments"), comment);
+      const commentId = commentDoc.id;
       await updateDoc(doc(db, "users", currentUser.uid), { lastCommentAt: serverTimestamp() });
       await updateDoc(doc(db, "posts", postId), { commentCount: increment(1), score: increment(3) });
       if (parentId) {
         const par = comments.find(c => c.id === parentId);
-        if (par && par.uid !== currentUser.uid) await addDoc(collection(db, "notifications"), { toUid: par.uid, fromUsername: currentUser.username, type: "reply_comment", postId, commentId: ref.id, read: false, createdAt: serverTimestamp() });
+        if (par && par.uid !== currentUser.uid) await addDoc(collection(db, "notifications"), { toUid: par.uid, fromUsername: currentUser.username, type: "reply_comment", postId, commentId, read: false, createdAt: serverTimestamp() });
         setReplyTo(null); setReplyText("");
       } else {
         const postSnap = await getDoc(doc(db, "posts", postId));
-        if (postSnap.exists() && postSnap.data().uid !== currentUser.uid) await addDoc(collection(db, "notifications"), { toUid: postSnap.data().uid, fromUsername: currentUser.username, type: "comment", postId, commentId: ref.id, read: false, createdAt: serverTimestamp() });
+        if (postSnap.exists() && postSnap.data().uid !== currentUser.uid) await addDoc(collection(db, "notifications"), { toUid: postSnap.data().uid, fromUsername: currentUser.username, type: "comment", postId, commentId, read: false, createdAt: serverTimestamp() });
         setNewComment("");
       }
     } catch (e) {
