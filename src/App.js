@@ -178,10 +178,6 @@ function timeAgo(ts) {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
-function randomColor() {
-  const colors = ["#ff6b6b","#4ecdc4","#ff8fab","#ffd93d","#ff9f43","#a29bfe","#fd79a8","#74b9ff","#55efc4","#fdcb6e","#e17055","#6c5ce7"];
-  return colors[Math.floor(Math.random() * colors.length)];
-}
 
 // ─── THEME CONTEXT ────────────────────────────────────────────────────────────
 // Simple global theme - toggled via localStorage
@@ -960,7 +956,7 @@ function ReportModal({ type, targetId, targetUid, reporterUid, onClose }) {
   const [reason, setReason] = useState(""); const [submitted, setSubmitted] = useState(false);
   const submit = async () => {
     if (!reason) return;
-    const reportRef = await addDoc(collection(db, "reports"), {
+    await addDoc(collection(db, "reports"), {
       type, targetId, targetUid: targetUid || null, reason, reporterUid,
       status: "pending", createdAt: serverTimestamp(),
     });
@@ -1080,7 +1076,7 @@ function CommentSection({ postId, currentUser, bannedWords }) {
     setLoading(true);
     try {
       const comment = { commentId: `c_${Date.now()}`, postId, parentId: parentId || null, username: currentUser.username, uid: currentUser.uid, text: text.trim(), createdAt: serverTimestamp(), likes: 0, likedBy: [] };
-      const ref = await addDoc(collection(db, "comments"), comment);
+      await addDoc(collection(db, "comments"), comment);
       // Write lastCommentAt so Firestore 30s rate-limit rule works
       await updateDoc(doc(db, "users", currentUser.uid), { lastCommentAt: serverTimestamp() });
       await updateDoc(doc(db, "posts", postId), { commentCount: increment(1), score: increment(3) });
@@ -1335,7 +1331,7 @@ function ComposePost({ currentUser, allCategories, bannedWords, onNewPost }) {
         ...(isDisappearing ? { disappearsAt: Timestamp.fromDate(new Date(Date.now() + DISAPPEAR_MS)) } : {}),
         ...(isPoll ? { poll: { labels: pollOptions.filter(o => o.trim()), options: Object.fromEntries(pollOptions.filter(o => o.trim()).map((_, i) => [i, 0])), votes: {} } } : {}),
       };
-      const ref = await addDoc(collection(db, "posts"), postData);
+      await addDoc(collection(db, "posts"), postData);
       await updateDoc(userRef, { lastPostAt: serverTimestamp(), firstPostDone: true, postCount: increment(1) });
       setContent(""); setPollOptions(["", ""]); setIsPoll(false); setIsDisappearing(false);
       startCooldown(Math.ceil(POST_COOLDOWN_MS / 1000));
