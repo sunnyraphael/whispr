@@ -81,11 +81,6 @@ const DEFAULT_BANNED_KEYWORDS = [
 //   settings/bypassEmails → { emails: ["you@undergraduate.mcu.edu.ng", ...] }
 // Only admins can read/write that document (see Firestore rules).
 
-// ─── INTERNAL EMAIL HELPER ────────────────────────────────────────────────────
-// Firebase Auth requires an email — we generate a hidden internal one from username
-function toInternalEmail(username) {
-  return `${username.trim().toLowerCase()}@whispr.internal`;
-}
 
 const POST_COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes
 const AUTO_BAN_THRESHOLD = 5; // reports before auto-ban
@@ -720,7 +715,7 @@ function TermsModal({ onAccept, onDecline }) {
 
 function AuthPage({ theme, toggleTheme, onSignupSuccess }) {
   const [mode, setMode] = useState("login");
-  const [username, setUsername] = useState("");
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -729,22 +724,16 @@ function AuthPage({ theme, toggleTheme, onSignupSuccess }) {
 
   const doSignup = async () => {
     setError(""); setLoading(true);
-    const trimmed = username.trim().toLowerCase();
-    if (!trimmed || trimmed.length < 3) { setError("Username must be at least 3 characters."); setLoading(false); return; }
-    if (!/^[a-zA-Z0-9_]+$/.test(trimmed)) { setError("Username can only contain letters, numbers and underscores."); setLoading(false); return; }
+    const normalizedEmail = email.trim().toLowerCase();
+    if (!normalizedEmail) { setError("Please enter an email address."); setLoading(false); return; }
     if (password.length < 6) { setError("Password must be at least 6 characters."); setLoading(false); return; }
 
     let cred = null;
     try {
       const fp = getDeviceFingerprint();
-      const internalEmail = toInternalEmail(trimmed);
 
-      // Check if username already taken
-      const userSnap = await getDocs(query(collection(db, "users"), where("chosenUsername", "==", trimmed)));
-      if (!userSnap.empty) { setError("That username is already taken. Please choose another."); setLoading(false); return; }
-
-      // Create Firebase auth account with internal email
-      cred = await createUserWithEmailAndPassword(auth, internalEmail, password);
+      // Create Firebase auth account
+      cred = await createUserWithEmailAndPassword(auth, normalizedEmail, password);
 
       // Check device ban
       const banSnap = await getDocs(query(collection(db, "deviceBans"), where("fingerprint", "==", fp)));
@@ -762,11 +751,11 @@ function AuthPage({ theme, toggleTheme, onSignupSuccess }) {
         setLoading(false); return;
       }
 
-      const anonUsername = generateUsername();
+      const username = generateUsername();
       const profileData = {
         uid: cred.user.uid,
-        chosenUsername: trimmed,
-        username: anonUsername,
+        email: normalizedEmail,
+        username,
         role: "user",
         banned: false,
         postCount: 0, firstPostDone: false,
@@ -781,7 +770,9 @@ function AuthPage({ theme, toggleTheme, onSignupSuccess }) {
       if (onSignupSuccess) onSignupSuccess(profileData);
     } catch (e) {
       if (cred) { try { await cred.user.delete(); await signOut(auth); } catch (_) {} }
-      if (e.code === "auth/email-already-in-use") setError("That username is already taken. Please choose another.");
+      if (e.code === "auth/email-already-in-use") setError("An account with this email already exists.");
+      else if (e.code === "auth/invalid-email") setError("Please enter a valid email address.");
+      else if (e.code === "auth/weak-password") setError("Password must be at least 6 characters.");
       else if (e.code === "auth/too-many-requests") setError("Too many attempts. Please wait a moment.");
       else if (e.code === "auth/network-request-failed") setError("Network error. Check your connection.");
       else setError("Something went wrong. Please try again.");
@@ -795,14 +786,13 @@ function AuthPage({ theme, toggleTheme, onSignupSuccess }) {
       await doSignup();
     } else {
       setError(""); setLoading(true);
-      const trimmed = username.trim().toLowerCase();
-      if (!trimmed) { setError("Enter your username."); setLoading(false); return; }
+      if (!email.trim()) { setError("Enter your email."); setLoading(false); return; }
       try {
-        await signInWithEmailAndPassword(auth, toInternalEmail(trimmed), password);
+        await signInWithEmailAndPassword(auth, email.trim().toLowerCase(), password);
       } catch (e) {
         if (e.code === "auth/too-many-requests") setError("Too many failed attempts. Please wait a few minutes.");
         else if (e.code === "auth/network-request-failed") setError("Network error. Check your connection.");
-        else setError("Incorrect username or password. Please try again.");
+        else setError("Incorrect email or password. Please try again.");
       }
       setLoading(false);
     }
@@ -821,17 +811,15 @@ function AuthPage({ theme, toggleTheme, onSignupSuccess }) {
         <div className="auth-logo">wh<span style={{ color: "var(--accent)" }}>i</span>spr</div>
         <div className="auth-sub">{mode === "signup" ? "Create your anonymous account." : "Welcome back. Your secret is safe."}</div>
         {error && <div className="alert alert-error">{error}</div>}
-        {mode === "signup" && <div className="alert alert-info">✨ Pick a username and password. You'll get a random anonymous display name — no one will know it's you.</div>}
-        {mode === "login" && <div className="alert alert-warn" style={{ fontSize: 12 }}>⚠️ Forgotten passwords cannot be reset. If you've lost yours, contact support to delete your account.</div>}
+        {mode === "signup" && <div className="alert alert-info">✨ Use any email and a password of your choice. You'll get a random anonymous display name — no one will know it's you.</div>}
         <div className="auth-field">
-          <label className="auth-label">Username</label>
-          <input className="auth-input" type="text" value={username} onChange={e => setUsername(e.target.value)} placeholder="e.g. sunny_r" onKeyDown={e => e.key === "Enter" && handleAuth()} autoCapitalize="none" />
-          {mode === "signup" && <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>Letters, numbers and underscores only. Min 3 characters.</div>}
+          <label className="auth-label">Email</label>
+          <input className="auth-input" type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="any email you want" onKeyDown={e => e.key === "Enter" && handleAuth()} autoCapitalize="none" />
         </div>
         <div className="auth-field">
           <label className="auth-label">Password</label>
           <input className="auth-input" type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" onKeyDown={e => e.key === "Enter" && handleAuth()} />
-          {mode === "signup" && <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>⚠️ Remember your password — if you forget it, your account cannot be recovered.</div>}
+          {mode === "signup" && <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>⚠️ Remember your email and password — if you forget them your account cannot be recovered.</div>}
         </div>
         {mode === "signup" && (
           <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 12, lineHeight: 1.6 }}>
@@ -844,7 +832,7 @@ function AuthPage({ theme, toggleTheme, onSignupSuccess }) {
         </button>
         <div style={{ textAlign: "center", marginTop: 20, fontSize: 13, color: "var(--muted)" }}>
           {mode === "login" ? "New here?" : "Already have an account?"}{" "}
-          <button onClick={() => { setMode(mode === "login" ? "signup" : "login"); setError(""); setTermsAccepted(false); setUsername(""); setPassword(""); }} style={{ background: "none", border: "none", color: "var(--accent)", cursor: "pointer", fontWeight: 600 }}>
+          <button onClick={() => { setMode(mode === "login" ? "signup" : "login"); setError(""); setTermsAccepted(false); setEmail(""); setPassword(""); }} style={{ background: "none", border: "none", color: "var(--accent)", cursor: "pointer", fontWeight: 600 }}>
             {mode === "login" ? "Sign Up" : "Log In"}
           </button>
         </div>
@@ -1734,7 +1722,7 @@ function AdminPanel({ currentUser, allCategories, setAllCategories }) {
 
       {tab === "users" && (
         <div className="card"><div className="table-wrap admin-table-wrap"><table>
-          <thead><tr><th>Display Name</th><th>Username</th><th>Role</th><th>Status</th><th>Last Seen</th><th>Device FP</th><th>Actions</th></tr></thead>
+          <thead><tr><th>Display Name</th><th>Email</th><th>Role</th><th>Status</th><th>Last Seen</th><th>Device FP</th><th>Actions</th></tr></thead>
           <tbody>
             {users.map(u => {
               const lastSeen = u.lastSeen?.toDate?.();
@@ -1754,7 +1742,7 @@ function AdminPanel({ currentUser, allCategories, setAllCategories }) {
               return (
                 <tr key={u.id}>
                   <td><div style={{ display: "flex", alignItems: "center", gap: 8 }}><Avatar username={u.username} />{u.username}</div></td>
-                  <td style={{ fontSize: 11, color: "var(--muted)", maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>@{u.chosenUsername || "—"}</td>
+                  <td style={{ fontSize: 11, color: "var(--muted)", maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{u.email || "—"}</td>
                   <td><span className={`badge ${u.role === "admin" ? "badge-purple" : "badge-success"}`}>{u.role || "user"}</span></td>
                   <td>
                     <span className={`badge ${status.cls}`}>{status.label}</span>
@@ -1842,12 +1830,12 @@ function AdminPanel({ currentUser, allCategories, setAllCategories }) {
                     </button>
                   </div>
                   <div className="table-wrap admin-table-wrap"><table>
-                    <thead><tr><th>Display Name</th><th>Username</th><th>Joined</th><th>Status</th><th>Note</th><th>Action</th></tr></thead>
+                    <thead><tr><th>Display Name</th><th>Email</th><th>Joined</th><th>Status</th><th>Note</th><th>Action</th></tr></thead>
                     <tbody>
                       {group.accounts.map((u, i) => (
                         <tr key={u.id} style={{ background: i === 0 ? "rgba(6,182,212,0.05)" : "rgba(239,68,68,0.05)" }}>
                           <td><div style={{ display: "flex", alignItems: "center", gap: 8 }}><Avatar username={u.username} />{u.username}</div></td>
-                          <td style={{ fontSize: 11, color: "var(--muted)" }}>@{u.chosenUsername || "—"}</td>
+                          <td style={{ fontSize: 11, color: "var(--muted)" }}>{u.email || "—"}</td>
                           <td style={{ fontSize: 12, color: "var(--muted)" }}>{timeAgo(u.createdAt)}</td>
                           <td><span className={`badge ${u.banned ? "badge-danger" : "badge-success"}`}>{u.banned ? "Banned" : "Active"}</span></td>
                           <td>{i === 0
