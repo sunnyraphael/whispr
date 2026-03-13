@@ -9,7 +9,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { initializeApp } from "firebase/app";
 import {
   getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword,
-  signOut, onAuthStateChanged, sendPasswordResetEmail,
+  signOut, onAuthStateChanged,
 } from "firebase/auth";
 import {
   getFirestore, collection, doc, addDoc, getDoc, getDocs, updateDoc,
@@ -81,11 +81,10 @@ const DEFAULT_BANNED_KEYWORDS = [
 //   settings/bypassEmails → { emails: ["you@undergraduate.mcu.edu.ng", ...] }
 // Only admins can read/write that document (see Firestore rules).
 
-// ─── UNIVERSITY EMAIL RESTRICTION ─────────────────────────────────────────────
-// Only MCU undergraduate emails can sign up
-const UNIVERSITY_EMAIL_DOMAIN = "@undergraduate.mcu.edu.ng";
-function isUniversityEmail(email) {
-  return email.trim().toLowerCase().endsWith(UNIVERSITY_EMAIL_DOMAIN);
+// ─── INTERNAL EMAIL HELPER ────────────────────────────────────────────────────
+// Firebase Auth requires an email — we generate a hidden internal one from username
+function toInternalEmail(username) {
+  return `${username.trim().toLowerCase()}@whispr.internal`;
 }
 
 const POST_COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes
@@ -637,7 +636,7 @@ For: McPherson University (MCU) students only
 By creating an account on Whispr MCU, you agree to the following terms. Please read carefully before proceeding.
 
 1. ELIGIBILITY
-   This platform is exclusively for students of McPherson University (MCU). Only valid MCU undergraduate email addresses (@undergraduate.mcu.edu.ng) are permitted to register. By signing up, you confirm you are a currently enrolled MCU student.
+   This platform is exclusively for students of McPherson University (MCU). By signing up, you confirm you are a currently enrolled MCU student. Accounts found to belong to non-students will be permanently banned.
 
 2. ANONYMITY & IDENTITY
    You will be assigned a randomly generated username. Your real identity is not displayed publicly. However, you must not attempt to reveal, guess, or expose other users' real identities. Doxxing of any kind will result in an immediate permanent ban.
@@ -664,7 +663,7 @@ By creating an account on Whispr MCU, you agree to the following terms. Please r
    Use the Report (🚩) button on any post that violates these terms. Do not abuse the report system. False or malicious reports are also a violation.
 
 8. ACCOUNT SUSPENSION & BANS
-   Accounts that violate these terms may be temporarily or permanently banned without notice. Attempting to create a new account after a ban using a different email is a further violation and will be reported to university authorities.
+   Accounts that violate these terms may be temporarily or permanently banned without notice. Attempting to create a new account after a ban is a further violation and will be reported to university authorities.
 
 9. ESCALATION TO UNIVERSITY AUTHORITIES
    In cases of serious violations — including but not limited to threats, harassment, or cyberbullying — the platform admin reserves the right to escalate the matter to MCU student affairs or relevant university authorities, providing any records necessary for investigation.
@@ -721,39 +720,31 @@ function TermsModal({ onAccept, onDecline }) {
 
 function AuthPage({ theme, toggleTheme, onSignupSuccess }) {
   const [mode, setMode] = useState("login");
-  const [email, setEmail] = useState("");
+  const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [showTerms, setShowTerms] = useState(false);
   const [termsAccepted, setTermsAccepted] = useState(false);
-  const [resetSent, setResetSent] = useState(false);
-  const [resetLoading, setResetLoading] = useState(false);
-
-  // Signup-specific errors reveal real info; login errors are intentionally vague to prevent email enumeration
-  const signupErrorMap = {
-    "auth/invalid-email": "Invalid email address.",
-    "auth/email-already-in-use": "An account with this email already exists.",
-    "auth/weak-password": "Password must be at least 6 characters.",
-    "auth/too-many-requests": "Too many attempts. Please wait a moment.",
-    "auth/network-request-failed": "Network error. Check your connection.",
-  };
-  // Login errors are vague on purpose — don't reveal whether email exists
-  const loginError = "Incorrect email or password. Please try again.";
 
   const doSignup = async () => {
     setError(""); setLoading(true);
-    if (!isUniversityEmail(email)) {
-      setError(`Only MCU undergraduate email addresses are allowed to sign up. Your email must end in ${UNIVERSITY_EMAIL_DOMAIN}`);
-      setLoading(false); return;
-    }
+    const trimmed = username.trim().toLowerCase();
+    if (!trimmed || trimmed.length < 3) { setError("Username must be at least 3 characters."); setLoading(false); return; }
+    if (!/^[a-zA-Z0-9_]+$/.test(trimmed)) { setError("Username can only contain letters, numbers and underscores."); setLoading(false); return; }
+    if (password.length < 6) { setError("Password must be at least 6 characters."); setLoading(false); return; }
+
     let cred = null;
     try {
       const fp = getDeviceFingerprint();
-      const normalizedEmail = email.trim().toLowerCase();
+      const internalEmail = toInternalEmail(trimmed);
 
-      // Create auth account first so subsequent Firestore reads are authenticated
-      cred = await createUserWithEmailAndPassword(auth, email, password);
+      // Check if username already taken
+      const userSnap = await getDocs(query(collection(db, "users"), where("chosenUsername", "==", trimmed)));
+      if (!userSnap.empty) { setError("That username is already taken. Please choose another."); setLoading(false); return; }
+
+      // Create Firebase auth account with internal email
+      cred = await createUserWithEmailAndPassword(auth, internalEmail, password);
 
       // Check device ban
       const banSnap = await getDocs(query(collection(db, "deviceBans"), where("fingerprint", "==", fp)));
@@ -763,31 +754,21 @@ function AuthPage({ theme, toggleTheme, onSignupSuccess }) {
         setLoading(false); return;
       }
 
-      // Check Firestore bypass list — now readable because user is authenticated
-      let isBypass = false;
-      try {
-        const bypassSnap = await getDoc(doc(db, "settings", "bypassEmails"));
-        if (bypassSnap.exists()) {
-          const bypassList = bypassSnap.data().emails || [];
-          isBypass = bypassList.map(e => e.toLowerCase()).includes(normalizedEmail);
-        }
-      } catch (_) { /* bypass list unreadable, treat as non-bypass */ }
-
-      // One device per account — skip for bypass emails
-      if (!isBypass) {
-        const existingSnap = await getDocs(query(collection(db, "users"), where("deviceFingerprint", "==", fp)));
-        if (!existingSnap.empty) {
-          await cred.user.delete(); await signOut(auth);
-          setError("An account has already been created from this device. Only one account is allowed per device.");
-          setLoading(false); return;
-        }
+      // One device per account
+      const existingSnap = await getDocs(query(collection(db, "users"), where("deviceFingerprint", "==", fp)));
+      if (!existingSnap.empty) {
+        await cred.user.delete(); await signOut(auth);
+        setError("An account already exists from this device. Only one account is allowed per device.");
+        setLoading(false); return;
       }
 
-      const username = generateUsername();
+      const anonUsername = generateUsername();
       const profileData = {
-        uid: cred.user.uid, email: normalizedEmail, username,
+        uid: cred.user.uid,
+        chosenUsername: trimmed,
+        username: anonUsername,
         role: "user",
-        banned: false, createdAt: null,
+        banned: false,
         postCount: 0, firstPostDone: false,
         lastPostAt: null, bookmarks: [],
         deviceFingerprint: fp,
@@ -799,9 +780,11 @@ function AuthPage({ theme, toggleTheme, onSignupSuccess }) {
       });
       if (onSignupSuccess) onSignupSuccess(profileData);
     } catch (e) {
-      // Clean up auth account if something went wrong after creation
       if (cred) { try { await cred.user.delete(); await signOut(auth); } catch (_) {} }
-      setError(signupErrorMap[e.code] || "Something went wrong. Please try again.");
+      if (e.code === "auth/email-already-in-use") setError("That username is already taken. Please choose another.");
+      else if (e.code === "auth/too-many-requests") setError("Too many attempts. Please wait a moment.");
+      else if (e.code === "auth/network-request-failed") setError("Network error. Check your connection.");
+      else setError("Something went wrong. Please try again.");
     }
     setLoading(false);
   };
@@ -812,32 +795,17 @@ function AuthPage({ theme, toggleTheme, onSignupSuccess }) {
       await doSignup();
     } else {
       setError(""); setLoading(true);
-      try { await signInWithEmailAndPassword(auth, email, password); }
-      catch (e) {
-        // Always show the same message regardless of error code — prevents email enumeration
-        if (e.code === "auth/too-many-requests") {
-          setError("Too many failed attempts. Please wait a few minutes before trying again.");
-        } else if (e.code === "auth/network-request-failed") {
-          setError("Network error. Check your connection and try again.");
-        } else {
-          setError(loginError);
-        }
+      const trimmed = username.trim().toLowerCase();
+      if (!trimmed) { setError("Enter your username."); setLoading(false); return; }
+      try {
+        await signInWithEmailAndPassword(auth, toInternalEmail(trimmed), password);
+      } catch (e) {
+        if (e.code === "auth/too-many-requests") setError("Too many failed attempts. Please wait a few minutes.");
+        else if (e.code === "auth/network-request-failed") setError("Network error. Check your connection.");
+        else setError("Incorrect username or password. Please try again.");
       }
       setLoading(false);
     }
-  };
-
-  const handleForgotPassword = async () => {
-    if (!email.trim()) { setError("Enter your email address above first, then click Forgot Password."); return; }
-    setResetLoading(true); setError(""); setResetSent(false);
-    try {
-      await sendPasswordResetEmail(auth, email);
-      setResetSent(true);
-    } catch (e) {
-      // Vague error here too — don't reveal if email exists
-      setResetSent(true); // Show success even if email not found (prevents enumeration)
-    }
-    setResetLoading(false);
   };
 
   return (
@@ -851,22 +819,19 @@ function AuthPage({ theme, toggleTheme, onSignupSuccess }) {
       <div className="auth-card fade-in">
         <button className="theme-btn" style={{ marginLeft: "auto", display: "flex", marginBottom: 12 }} onClick={toggleTheme}>{theme === "dark" ? "☀️" : "🌙"}</button>
         <div className="auth-logo">wh<span style={{ color: "var(--accent)" }}>i</span>spr</div>
-        <div className="auth-sub">{mode === "signup" ? "MCU students only — use your undergraduate email." : "Welcome back. Your secret is safe."}</div>
+        <div className="auth-sub">{mode === "signup" ? "Create your anonymous account." : "Welcome back. Your secret is safe."}</div>
         {error && <div className="alert alert-error">{error}</div>}
-        {resetSent && <div className="alert alert-success">✅ If that email is registered, a password reset link has been sent.</div>}
-        {mode === "signup" && <div className="alert alert-info">✨ Use your MCU email (@undergraduate.mcu.edu.ng) to sign up. You'll get a random anonymous username.</div>}
+        {mode === "signup" && <div className="alert alert-info">✨ Pick a username and password. You'll get a random anonymous display name — no one will know it's you.</div>}
+        {mode === "login" && <div className="alert alert-warn" style={{ fontSize: 12 }}>⚠️ Forgotten passwords cannot be reset. If you've lost yours, contact support to delete your account.</div>}
         <div className="auth-field">
-          <label className="auth-label">MCU Email</label>
-          <input className="auth-input" type="email" value={email} onChange={e => setEmail(e.target.value)} placeholder="student@undergraduate.mcu.edu.ng" onKeyDown={e => e.key === "Enter" && handleAuth()} />
+          <label className="auth-label">Username</label>
+          <input className="auth-input" type="text" value={username} onChange={e => setUsername(e.target.value)} placeholder="e.g. sunny_r" onKeyDown={e => e.key === "Enter" && handleAuth()} autoCapitalize="none" />
+          {mode === "signup" && <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>Letters, numbers and underscores only. Min 3 characters.</div>}
         </div>
         <div className="auth-field">
           <label className="auth-label">Password</label>
           <input className="auth-input" type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" onKeyDown={e => e.key === "Enter" && handleAuth()} />
-          {mode === "login" && (
-            <button onClick={handleForgotPassword} disabled={resetLoading} style={{ background: "none", border: "none", color: "var(--accent)", cursor: "pointer", fontSize: 12, marginTop: 6, padding: 0, textAlign: "left" }}>
-              {resetLoading ? "Sending..." : "Forgot password?"}
-            </button>
-          )}
+          {mode === "signup" && <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>⚠️ Remember your password — if you forget it, your account cannot be recovered.</div>}
         </div>
         {mode === "signup" && (
           <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 12, lineHeight: 1.6 }}>
@@ -879,7 +844,7 @@ function AuthPage({ theme, toggleTheme, onSignupSuccess }) {
         </button>
         <div style={{ textAlign: "center", marginTop: 20, fontSize: 13, color: "var(--muted)" }}>
           {mode === "login" ? "New here?" : "Already have an account?"}{" "}
-          <button onClick={() => { setMode(mode === "login" ? "signup" : "login"); setError(""); setResetSent(false); setTermsAccepted(false); }} style={{ background: "none", border: "none", color: "var(--accent)", cursor: "pointer", fontWeight: 600 }}>
+          <button onClick={() => { setMode(mode === "login" ? "signup" : "login"); setError(""); setTermsAccepted(false); setUsername(""); setPassword(""); }} style={{ background: "none", border: "none", color: "var(--accent)", cursor: "pointer", fontWeight: 600 }}>
             {mode === "login" ? "Sign Up" : "Log In"}
           </button>
         </div>
@@ -1769,7 +1734,7 @@ function AdminPanel({ currentUser, allCategories, setAllCategories }) {
 
       {tab === "users" && (
         <div className="card"><div className="table-wrap admin-table-wrap"><table>
-          <thead><tr><th>Username</th><th>Email</th><th>Role</th><th>Status</th><th>Last Seen</th><th>Device FP</th><th>Actions</th></tr></thead>
+          <thead><tr><th>Display Name</th><th>Username</th><th>Role</th><th>Status</th><th>Last Seen</th><th>Device FP</th><th>Actions</th></tr></thead>
           <tbody>
             {users.map(u => {
               const lastSeen = u.lastSeen?.toDate?.();
@@ -1789,7 +1754,7 @@ function AdminPanel({ currentUser, allCategories, setAllCategories }) {
               return (
                 <tr key={u.id}>
                   <td><div style={{ display: "flex", alignItems: "center", gap: 8 }}><Avatar username={u.username} />{u.username}</div></td>
-                  <td style={{ fontSize: 11, color: "var(--muted)", maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{u.email}</td>
+                  <td style={{ fontSize: 11, color: "var(--muted)", maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>@{u.chosenUsername || "—"}</td>
                   <td><span className={`badge ${u.role === "admin" ? "badge-purple" : "badge-success"}`}>{u.role || "user"}</span></td>
                   <td>
                     <span className={`badge ${status.cls}`}>{status.label}</span>
@@ -1877,12 +1842,12 @@ function AdminPanel({ currentUser, allCategories, setAllCategories }) {
                     </button>
                   </div>
                   <div className="table-wrap admin-table-wrap"><table>
-                    <thead><tr><th>Username</th><th>Email</th><th>Joined</th><th>Status</th><th>Note</th><th>Action</th></tr></thead>
+                    <thead><tr><th>Display Name</th><th>Username</th><th>Joined</th><th>Status</th><th>Note</th><th>Action</th></tr></thead>
                     <tbody>
                       {group.accounts.map((u, i) => (
                         <tr key={u.id} style={{ background: i === 0 ? "rgba(6,182,212,0.05)" : "rgba(239,68,68,0.05)" }}>
                           <td><div style={{ display: "flex", alignItems: "center", gap: 8 }}><Avatar username={u.username} />{u.username}</div></td>
-                          <td style={{ fontSize: 11, color: "var(--muted)" }}>{u.email}</td>
+                          <td style={{ fontSize: 11, color: "var(--muted)" }}>@{u.chosenUsername || "—"}</td>
                           <td style={{ fontSize: 12, color: "var(--muted)" }}>{timeAgo(u.createdAt)}</td>
                           <td><span className={`badge ${u.banned ? "badge-danger" : "badge-success"}`}>{u.banned ? "Banned" : "Active"}</span></td>
                           <td>{i === 0
