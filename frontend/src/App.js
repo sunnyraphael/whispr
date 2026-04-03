@@ -8,15 +8,15 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { initializeApp } from "firebase/app";
 import {
-  getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword,
+  getAuth, signInWithEmailAndPassword,
   signOut, onAuthStateChanged,
 } from "firebase/auth";
 import {
   getFirestore, collection, doc, addDoc, getDoc, getDocs, updateDoc,
   deleteDoc, query, where, orderBy, limit, onSnapshot, serverTimestamp,
-  increment, arrayUnion, arrayRemove, Timestamp, setDoc, writeBatch, startAfter, deleteField,
+  increment, arrayUnion, arrayRemove, Timestamp, setDoc, writeBatch, startAfter,
 } from "firebase/firestore";
-import { initializeAppCheck, ReCaptchaV3Provider } from "firebase/app-check";
+// App Check disabled for v2 development
 
 // ─── FIREBASE CONFIG ──────────────────────────────────────────────────────────
 const firebaseConfig = {
@@ -66,20 +66,8 @@ const DEFAULT_BANNED_KEYWORDS = [
 
 
 const POST_COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes
-const AUTO_BAN_THRESHOLD = 5; // reports before auto-ban
-const AUTO_DELETE_THRESHOLD = 10; // reports before auto-delete
-const EDIT_WINDOW_MS = 5 * 60 * 1000; // 5 mins to edit post
 const DISAPPEAR_MS = 24 * 60 * 60 * 1000; // 24 hours
-
-const ADJECTIVES = ["Silent","Whispering","Hidden","Midnight","Phantom","Shadow","Velvet","Crimson","Azure","Golden","Silver","Cosmic","Mystic","Neon","Lunar","Solar","Arctic","Storm","Thunder","Crystal","Brave","Swift","Clever","Witty","Calm","Bold","Fierce","Gentle"];
-const NOUNS = ["Fox","Wolf","Raven","Phoenix","Serpent","Falcon","Owl","Bear","Tiger","Lynx","Hawk","Panda","Otter","Jaguar","Viper","Eagle","Poet","Ghost","Rebel","Sage","Nomad","Oracle","Cipher","Specter","Wraith","Monk","Bard","Scout","Ranger","Knight","Rogue","Mystic"];
-
-function generateUsername() {
-  const adj = ADJECTIVES[Math.floor(Math.random() * ADJECTIVES.length)];
-  const noun = NOUNS[Math.floor(Math.random() * NOUNS.length)];
-  const num = Math.floor(Math.random() * 9000) + 1000;
-  return `${adj}${noun}${num}`;
-}
+const EDIT_WINDOW_MS = 5 * 60 * 1000; // 5 mins to edit post
 
 
 function getDeviceFingerprint() {
@@ -1166,7 +1154,7 @@ function PostCard({ post, currentUser, onOpen, allCategories, onBookmark, isBook
             {isAdmin && <button className="btn btn-sm" style={{ padding: "4px 8px", fontSize: 12, background: "none", border: "none", color: "var(--muted)" }} onClick={pinPost}>{post.pinned ? "📌" : "📍"}</button>}
           </div>
         </div>
-        {post.poll && <div style={{ fontSize: 13, color: "var(--accent)", marginBottom: 10, fontWeight: 600 }}>🗳️ Poll: {post.poll.labels.join(" vs ")}</div>}
+        {post.poll && <div onClick={e => e.stopPropagation()}><PollDisplay poll={post.poll} postId={post.id} currentUser={currentUser} /></div>}
         <div className="post-content" style={{ WebkitLineClamp: 4, overflow: "hidden", display: "-webkit-box", WebkitBoxOrient: "vertical" }}>{post.content}</div>
         <div className="post-actions" onClick={e => e.stopPropagation()}>
           <button className={`action-btn ${liked ? "liked" : ""}`} onClick={toggleLike}>{liked ? "♥" : "♡"} {post.likes || 0}</button>
@@ -1684,18 +1672,30 @@ function AdminPanel({ currentUser, allCategories, setAllCategories }) {
 
       {tab === "reports" && (
         <div className="card"><div className="table-wrap admin-table-wrap"><table>
-          <thead><tr><th>Type</th><th>Reason</th><th>Status</th><th>Time</th><th>Actions</th></tr></thead>
+          <thead><tr><th>Type</th><th>Reason</th><th>Post Content</th><th>Status</th><th>Time</th><th>Actions</th></tr></thead>
           <tbody>
-            {reports.length === 0 && <tr><td colSpan={5} style={{ textAlign: "center", color: "var(--muted)", padding: 32 }}>No reports yet</td></tr>}
-            {reports.map(r => (
-              <tr key={r.id}>
-                <td><span className="badge badge-purple">{r.type}</span></td>
-                <td>{r.reason}</td>
-                <td><span className={`badge ${r.status === "pending" ? "badge-warn" : r.status === "resolved" ? "badge-success" : "badge-danger"}`}>{r.status}</span></td>
-                <td style={{ color: "var(--muted)" }}>{timeAgo(r.createdAt)}</td>
-                <td>{r.status === "pending" && <div style={{ display: "flex", gap: 6 }}><button className="btn btn-primary btn-sm" onClick={() => resolveReport(r.id)}>Resolve</button><button className="btn btn-ghost btn-sm" onClick={() => dismissReport(r.id)}>Dismiss</button></div>}</td>
-              </tr>
-            ))}
+            {reports.length === 0 && <tr><td colSpan={6} style={{ textAlign: "center", color: "var(--muted)", padding: 32 }}>No reports yet</td></tr>}
+            {reports.map(r => {
+              const reportedPost = posts.find(p => p.id === r.targetId);
+              return (
+                <tr key={r.id}>
+                  <td><span className="badge badge-purple">{r.type}</span></td>
+                  <td>{r.reason}</td>
+                  <td style={{ maxWidth: 200 }}>
+                    {reportedPost
+                      ? <div style={{ fontSize: 12, color: "var(--text)", background: "var(--surface2)", padding: "6px 8px", borderRadius: 6, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          <span style={{ color: "var(--muted)", fontSize: 11 }}>@{reportedPost.username}: </span>
+                          {reportedPost.content}
+                        </div>
+                      : <span style={{ fontSize: 11, color: "var(--muted)" }}>{r.targetId?.slice(0, 8) || "—"}</span>
+                    }
+                  </td>
+                  <td><span className={`badge ${r.status === "pending" ? "badge-warn" : r.status === "resolved" ? "badge-success" : "badge-danger"}`}>{r.status}</span></td>
+                  <td style={{ color: "var(--muted)" }}>{timeAgo(r.createdAt)}</td>
+                  <td>{r.status === "pending" && <div style={{ display: "flex", gap: 6 }}><button className="btn btn-primary btn-sm" onClick={() => resolveReport(r.id)}>Resolve</button><button className="btn btn-ghost btn-sm" onClick={() => dismissReport(r.id)}>Dismiss</button></div>}</td>
+                </tr>
+              );
+            })}
           </tbody>
         </table></div></div>
       )}
