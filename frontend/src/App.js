@@ -6,57 +6,25 @@
 // After first signup, set role: "admin" on your user doc in Firebase Console → Firestore
 
 import { useState, useEffect, useRef, useCallback } from "react";
-import { initializeApp } from "firebase/app";
 import {
-  getAuth, signInWithEmailAndPassword,
+  signInWithEmailAndPassword,
   signOut, onAuthStateChanged,
 } from "firebase/auth";
 import {
-  getFirestore, collection, doc, addDoc, getDoc, getDocs, updateDoc,
+  collection, doc, addDoc, getDoc, getDocs, updateDoc,
   deleteDoc, query, where, orderBy, limit, onSnapshot, serverTimestamp,
   increment, arrayUnion, arrayRemove, Timestamp, setDoc, writeBatch, startAfter,
 } from "firebase/firestore";
-// App Check disabled for v2 development
-
-// ─── FIREBASE CONFIG ──────────────────────────────────────────────────────────
-const firebaseConfig = {
-  apiKey: "AIzaSyB3MmPn44i3yGC5LpuxzNiaZDd6eke-mcE",
-  authDomain: "whispr-v2.firebaseapp.com",
-  projectId: "whispr-v2",
-  storageBucket: "whispr-v2.firebasestorage.app",
-  messagingSenderId: "338774310441",
-  appId: "1:338774310441:web:404620c8667131b8072638",
-  measurementId: "G-SXMMWSPE6Z"
-};
-
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-const db = getFirestore(app);
-
-// ─── APP CHECK (reCAPTCHA v3) ─────────────────────────────────────────────────
-// Prevents external scripts from abusing your Firebase project.
-// Steps to activate:
-//   1. Go to Firebase Console → App Check → Register your web app
-// App Check disabled for v2 development — re-enable before production deploy
-
-// ─── CONSTANTS ────────────────────────────────────────────────────────────────
-const DEFAULT_CATEGORIES = [
-  { id: "confessions", label: "#confessions", color: "#ff6b6b" },
-  { id: "school", label: "#school", color: "#4ecdc4" },
-  { id: "relationships", label: "#relationships", color: "#ff8fab" },
-  { id: "work", label: "#work", color: "#ffd93d" },
-  { id: "rants", label: "#rants", color: "#ff9f43" },
-  { id: "advice", label: "#advice", color: "#a29bfe" },
-  { id: "secrets", label: "#secrets", color: "#fd79a8" },
-  { id: "random", label: "#random", color: "#74b9ff" },
-];
-
-const REACTIONS = ["❤️", "😂", "😮", "😢", "🔥", "👀"];
-
-const DEFAULT_BANNED_KEYWORDS = [
-  "nigger", "faggot", "kill yourself", "kys", "rape", "terrorist",
-  "bomb threat", "suicide method", "how to make a bomb",
-];
+import Spinner from "./components/shared/Spinner";
+import StyleTag from "./components/layout/StyleTag";
+import PushToast from "./components/layout/PushToast";
+import { useForegroundPush } from "./hooks/useForegroundPush";
+import { auth, db, registerForPushNotifications } from "./firebase";
+import { DEFAULT_CATEGORIES, REACTIONS, DEFAULT_BANNED_KEYWORDS, POST_COOLDOWN_MS, DISAPPEAR_MS, EDIT_WINDOW_MS } from "./constants";
+import { getDeviceFingerprint } from "./utils/fingerprint";
+import { filterContent } from "./utils/filter";
+import { timeAgo } from "./utils/time";
+import { getTheme, setThemeStorage } from "./utils/theme";
 
 // ─── ADMIN NOTE ───────────────────────────────────────────────────────────────
 // Admin role is set directly in Firebase Console → Firestore → users → your doc → role: "admin"
@@ -65,526 +33,6 @@ const DEFAULT_BANNED_KEYWORDS = [
 // Only admins can read/write that document (see Firestore rules).
 
 
-const POST_COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes
-const DISAPPEAR_MS = 24 * 60 * 60 * 1000; // 24 hours
-const EDIT_WINDOW_MS = 5 * 60 * 1000; // 5 mins to edit post
-
-
-function getDeviceFingerprint() {
-  const nav = window.navigator;
-  const screen = window.screen;
-
-  // Canvas fingerprint — unique per GPU/driver/OS combination
-  let canvasFp = "";
-  try {
-    const canvas = document.createElement("canvas");
-    const ctx = canvas.getContext("2d");
-    ctx.textBaseline = "top";
-    ctx.font = "14px Arial";
-    ctx.fillStyle = "#f60";
-    ctx.fillRect(0, 0, 100, 30);
-    ctx.fillStyle = "#069";
-    ctx.fillText("Whispr🔒", 2, 2);
-    canvasFp = canvas.toDataURL().slice(-50);
-  } catch (_) {}
-
-  // WebGL renderer — very unique per graphics card
-  let webglFp = "";
-  try {
-    const gl = document.createElement("canvas").getContext("webgl");
-    if (gl) {
-      const dbg = gl.getExtension("WEBGL_debug_renderer_info");
-      if (dbg) webglFp = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL);
-    }
-  } catch (_) {}
-
-  const raw = [
-    nav.userAgent,
-    nav.language,
-    nav.languages?.join(",") || "",
-    nav.platform,
-    screen.width, screen.height, screen.colorDepth,
-    screen.availWidth, screen.availHeight,
-    new Date().getTimezoneOffset(),
-    Intl.DateTimeFormat().resolvedOptions().timeZone || "",
-    nav.hardwareConcurrency || "",
-    nav.deviceMemory || "",
-    nav.maxTouchPoints || "",
-    !!nav.cookieEnabled,
-    !!window.indexedDB,
-    !!window.localStorage,
-    canvasFp,
-    webglFp,
-  ].join("|");
-
-  let hash = 5381;
-  for (let i = 0; i < raw.length; i++) {
-    hash = ((hash << 5) + hash) ^ raw.charCodeAt(i);
-    hash |= 0;
-  }
-  return "fp_" + Math.abs(hash).toString(36);
-}
-
-function filterContent(text, banned = DEFAULT_BANNED_KEYWORDS) {
-  const lower = text.toLowerCase();
-  for (const kw of banned) {
-    if (lower.includes(kw)) return { blocked: true, keyword: kw };
-  }
-  return { blocked: false };
-}
-
-function timeAgo(ts) {
-  if (!ts) return "just now";
-  const date = ts.toDate ? ts.toDate() : new Date(ts);
-  const diff = (Date.now() - date.getTime()) / 1000;
-  if (diff < 60) return `${Math.floor(diff)}s ago`;
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  return `${Math.floor(diff / 86400)}d ago`;
-}
-
-
-// ─── THEME CONTEXT ────────────────────────────────────────────────────────────
-// Simple global theme - toggled via localStorage
-const getTheme = () => localStorage.getItem("whispr_theme") || "dark";
-const setThemeStorage = (t) => localStorage.setItem("whispr_theme", t);
-
-// ─── STYLES ───────────────────────────────────────────────────────────────────
-function buildStyles(theme) {
-  const dark = theme === "dark";
-  return `
-  @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,300&display=swap');
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  :root {
-    --bg: ${dark ? "#0a0a0f" : "#f0f0f8"};
-    --surface: ${dark ? "#12121a" : "#ffffff"};
-    --surface2: ${dark ? "#1a1a26" : "#f5f5ff"};
-    --surface3: ${dark ? "#22223a" : "#e8e8f8"};
-    --border: ${dark ? "rgba(255,255,255,0.07)" : "rgba(0,0,0,0.1)"};
-    --text: ${dark ? "#e8e8f0" : "#111128"};
-    --muted: ${dark ? "#8888aa" : "#6666aa"};
-    --accent: #7c3aed;
-    --accent2: #06b6d4;
-    --danger: #ef4444;
-    --warn: #f59e0b;
-    --success: #10b981;
-    --glow: rgba(124,58,237,0.3);
-    --font-display: 'Syne', sans-serif;
-    --font-body: 'DM Sans', sans-serif;
-    --radius: 16px; --radius-sm: 8px;
-    --shadow: ${dark ? "0 4px 24px rgba(0,0,0,0.4)" : "0 4px 24px rgba(0,0,0,0.12)"};
-  }
-  body { background: var(--bg); color: var(--text); font-family: var(--font-body); min-height: 100vh; transition: background 0.3s, color 0.3s; }
-  ::-webkit-scrollbar { width: 4px; }
-  ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: var(--surface3); border-radius: 4px; }
-
-  .app { min-height: 100vh; display: flex; flex-direction: column; }
-  .navbar {
-    position: sticky; top: 0; z-index: 100;
-    background: ${dark ? "rgba(10,10,15,0.85)" : "rgba(240,240,248,0.9)"}; backdrop-filter: blur(20px);
-    border-bottom: 1px solid var(--border);
-    padding: 0 24px; height: 64px;
-    display: flex; align-items: center; justify-content: space-between;
-  }
-  .logo { font-family: var(--font-display); font-size: 22px; font-weight: 800; color: var(--text); letter-spacing: -0.5px; }
-  .logo span { color: var(--accent); }
-  .nav-right { display: flex; align-items: center; gap: 10px; flex-wrap: nowrap; }
-  .main { display: flex; max-width: 1200px; margin: 0 auto; width: 100%; padding: 24px 16px; gap: 24px; }
-  .feed-col { flex: 1; min-width: 0; }
-  .sidebar { width: 280px; flex-shrink: 0; }
-
-  /* Mobile */
-  @media (max-width: 900px) { .sidebar { display: none; } }
-  @media (max-width: 600px) {
-    /* Navbar */
-    .navbar { padding: 0 12px; height: 52px; }
-    .logo { font-size: 18px; }
-    .nav-username { display: none; }
-
-    /* Search bar — hide from navbar on mobile, show as full-width bar below navbar instead */
-    .search-bar { display: none; }
-    .mobile-search-bar {
-      display: flex; align-items: center;
-      background: var(--surface2); border-bottom: 1px solid var(--border);
-      padding: 8px 12px; gap: 8px;
-    }
-    .mobile-search-bar input {
-      flex: 1; background: var(--surface); border: 1px solid var(--border);
-      border-radius: 20px; padding: 8px 16px 8px 16px;
-      color: var(--text); font-family: var(--font-body); font-size: 14px;
-      outline: none; min-width: 0;
-    }
-    .mobile-search-bar input:focus { border-color: var(--accent); }
-    .mobile-search-clear {
-      background: none; border: none; color: var(--muted);
-      font-size: 16px; cursor: pointer; padding: 4px; flex-shrink: 0;
-    }
-
-    /* Layout */
-    .main { padding: 10px 8px; gap: 12px; }
-    .feed-col { min-width: 0; }
-
-    /* Cards */
-    .card-pad { padding: 14px; }
-    .card { border-radius: 12px; }
-
-    /* Compose — keep footer as single row on mobile, shrink elements */
-    .compose-area { font-size: 14px; min-height: 80px; }
-    .compose-footer { flex-wrap: nowrap; gap: 6px; }
-    .compose-footer .category-select { max-width: 90px; font-size: 12px; padding: 6px 6px; }
-    .compose-footer .btn-sm { padding: 6px 8px; font-size: 11px; }
-    .compose-footer .btn-primary { padding: 7px 14px; font-size: 13px; }
-    .char-count { font-size: 11px; }
-
-    /* Post actions */
-    .action-btn { padding: 5px 10px; font-size: 12px; }
-    .post-actions { flex-wrap: wrap; gap: 6px; }
-
-    /* Auth */
-    .auth-card { padding: 24px 18px; border-radius: 16px; margin: 12px; }
-    .auth-logo { font-size: 32px; }
-    .auth-wrap { padding: 12px; align-items: flex-start; padding-top: 40px; }
-
-    /* Modal */
-    .modal { border-radius: 16px 16px 0 0; max-height: 92vh; }
-    .modal-overlay { align-items: flex-end; padding: 0; }
-
-    /* Notifications & Support panels — fixed to viewport so they never clip */
-    .notif-panel {
-      position: fixed !important;
-      top: 60px !important;
-      left: 12px !important;
-      right: 12px !important;
-      width: auto !important;
-      max-height: calc(100vh - 80px);
-      overflow-y: auto;
-      z-index: 300;
-    }
-
-    /* Profile dropdown */
-    .profile-dropdown { right: 0; min-width: 160px; }
-
-    /* Tabs */
-    .tab { padding: 5px 12px; font-size: 12px; }
-    /* Admin tabs — switch to a full-width select dropdown on mobile */
-    .admin-tabs-desktop { display: none; }
-    .admin-tabs-mobile { display: block; width: 100%; background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text); font-family: var(--font-body); font-size: 14px; padding: 10px 12px; cursor: pointer; margin-bottom: 16px; }
-    /* All admin tables scroll horizontally */
-    .admin-table-wrap {
-      overflow-x: auto;
-      -webkit-overflow-scrolling: touch;
-      border-radius: var(--radius-sm);
-    }
-    .admin-table-wrap::after {
-      content: "← scroll →";
-      display: block;
-      text-align: center;
-      font-size: 11px;
-      color: var(--muted);
-      padding: 6px 0 2px;
-      opacity: 0.6;
-    }
-    .admin-table-wrap table { min-width: 600px; font-size: 11px; }
-    .admin-table-wrap th { padding: 8px 8px; font-size: 10px; }
-    .admin-table-wrap td { padding: 8px 8px; font-size: 11px; }
-    .admin-table-wrap .btn-sm { padding: 4px 8px; font-size: 10px; }
-    .admin-page { padding: 12px 8px; }
-    .admin-title { font-size: 20px; }
-    .stat-card { padding: 12px; }
-    .stat-num { font-size: 22px; }
-    /* Admin stat cards wrap nicely */
-    .stats-grid { grid-template-columns: repeat(2, 1fr) !important; }
-    .section-tab { font-size: 12px; padding: 8px 6px; }
-
-    /* Trending numbers */
-    .trending-num { font-size: 14px; }
-
-    /* Typography */
-    .post-content { font-size: 14px; line-height: 1.6; }
-    
-    /* Buttons in modals */
-    .modal .btn { font-size: 13px; padding: 8px 14px; }
-
-    /* Avatar */
-    .avatar { width: 32px; height: 32px; font-size: 12px; }
-
-    /* Category tags */
-    .category-tag { font-size: 10px; padding: 2px 8px; }
-
-    /* Cooldown bar */
-    .cooldown-bar { height: 2px; }
-  }
-
-  /* Extra small phones */
-  @media (max-width: 380px) {
-    .auth-card { padding: 20px 14px; }
-    .navbar { padding: 0 8px; }
-    .main { padding: 8px 6px; }
-  }
-
-  /* Hide mobile search bar on desktop */
-  @media (min-width: 601px) {
-    .mobile-search-bar { display: none; }
-    .admin-tabs-desktop { display: flex !important; }
-    .admin-tabs-mobile { display: none !important; }
-  }
-
-  /* Touch — larger tap targets */
-  @media (hover: none) and (pointer: coarse) {
-    .action-btn { min-height: 36px; }
-    .btn { min-height: 40px; }
-    .tab { min-height: 36px; }
-    .close-btn { width: 40px; height: 40px; }
-    .theme-btn { width: 40px; height: 40px; }
-    .notif-btn { width: 40px; height: 40px; }
-  }
-
-  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; transition: border-color 0.2s, background 0.3s; }
-  .card:hover { border-color: rgba(124,58,237,0.25); }
-  .card-pad { padding: 20px; }
-
-  /* Pinned */
-  .pinned-post { border: 1px solid rgba(124,58,237,0.4) !important; background: ${dark ? "rgba(124,58,237,0.05)" : "rgba(124,58,237,0.03)"} !important; }
-  .pin-badge { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--accent); font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
-
-  /* Announcement */
-  .announcement { border: 1px solid rgba(245,158,11,0.4) !important; background: ${dark ? "rgba(245,158,11,0.06)" : "rgba(245,158,11,0.04)"} !important; margin-bottom: 16px; border-radius: var(--radius); overflow: hidden; }
-  .announcement-badge { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--warn); font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
-
-  /* Disappearing */
-  .disappearing-badge { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--accent2); font-weight: 600; }
-
-  .post-card { margin-bottom: 16px; cursor: pointer; }
-  .post-header { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 12px; }
-  .post-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .avatar { width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 700; font-family: var(--font-display); flex-shrink: 0; }
-  .username { font-size: 13px; font-weight: 600; color: var(--text); }
-  .timestamp { font-size: 12px; color: var(--muted); }
-  .post-id { font-size: 11px; color: var(--muted); font-family: monospace; }
-  .category-tag { font-size: 11px; font-weight: 600; padding: 3px 10px; border-radius: 20px; letter-spacing: 0.3px; display: inline-block; }
-  .post-content { font-size: 15px; line-height: 1.7; color: var(--text); margin-bottom: 16px; white-space: pre-wrap; word-break: break-word; }
-  .post-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-  .action-btn { display: flex; align-items: center; gap: 6px; background: none; border: 1px solid var(--border); border-radius: 20px; padding: 6px 14px; font-size: 13px; color: var(--muted); cursor: pointer; font-family: var(--font-body); transition: all 0.15s; }
-  .action-btn:hover { border-color: var(--accent); color: var(--text); background: var(--surface2); }
-  .action-btn.liked { border-color: #ef4444; color: #ef4444; background: rgba(239,68,68,0.1); }
-  .action-btn.bookmarked { border-color: var(--warn); color: var(--warn); background: rgba(245,158,11,0.1); }
-  .action-btn.reacted { border-color: var(--accent); color: var(--text); background: rgba(124,58,237,0.1); }
-  .reaction-picker { position: absolute; bottom: 100%; left: 0; margin-bottom: 8px; background: var(--surface2); border: 1px solid var(--border); border-radius: 40px; padding: 8px 12px; display: flex; gap: 8px; z-index: 50; box-shadow: var(--shadow); }
-  .reaction-btn { font-size: 20px; cursor: pointer; transition: transform 0.15s; background: none; border: none; line-height: 1; }
-  .reaction-btn:hover { transform: scale(1.3); }
-  .reaction-counts { display: flex; gap: 6px; flex-wrap: wrap; }
-  .reaction-count { font-size: 12px; background: var(--surface2); border: 1px solid var(--border); border-radius: 20px; padding: 3px 10px; }
-
-  /* Poll */
-  .poll-option { margin-bottom: 10px; cursor: pointer; }
-  .poll-bar-wrap { height: 36px; background: var(--surface2); border-radius: 8px; position: relative; overflow: hidden; border: 1px solid var(--border); }
-  .poll-bar { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent2)); opacity: 0.3; transition: width 0.4s ease; }
-  .poll-bar-voted { opacity: 0.6; }
-  .poll-label { position: absolute; inset: 0; display: flex; align-items: center; padding: 0 12px; font-size: 13px; font-weight: 500; justify-content: space-between; }
-
-  /* Compose */
-  .compose-card { margin-bottom: 20px; }
-  .compose-inner { padding: 20px; }
-  .compose-header { font-family: var(--font-display); font-size: 14px; font-weight: 700; color: var(--muted); margin-bottom: 12px; letter-spacing: 0.5px; text-transform: uppercase; }
-  .compose-area { width: 100%; min-height: 100px; background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 14px; color: var(--text); font-family: var(--font-body); font-size: 15px; resize: vertical; line-height: 1.6; transition: border-color 0.2s; }
-  .compose-area:focus { outline: none; border-color: var(--accent); }
-  .compose-area::placeholder { color: var(--muted); }
-  .compose-footer { display: flex; align-items: center; justify-content: space-between; margin-top: 12px; flex-wrap: nowrap; gap: 8px; }
-  .category-select { background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text); font-family: var(--font-body); font-size: 13px; padding: 8px 12px; cursor: pointer; }
-  .category-select:focus { outline: none; border-color: var(--accent); }
-  .char-count { font-size: 12px; color: var(--muted); }
-  .char-count.warn { color: var(--warn); }
-  .char-count.over { color: var(--danger); }
-
-  /* Cooldown */
-  .cooldown-bar { height: 3px; background: linear-gradient(90deg, var(--accent), var(--accent2)); border-radius: 3px; transition: width 0.5s linear; }
-  .cooldown-msg { font-size: 12px; color: var(--warn); margin-top: 6px; }
-
-  /* Edit */
-  .edit-window { font-size: 11px; color: var(--accent2); display: inline-flex; align-items: center; gap: 4px; }
-
-  .btn { padding: 9px 20px; border-radius: var(--radius-sm); font-family: var(--font-display); font-size: 13px; font-weight: 700; cursor: pointer; border: none; transition: all 0.15s; letter-spacing: 0.3px; display: inline-flex; align-items: center; gap: 6px; }
-  .btn-primary { background: var(--accent); color: white; }
-  .btn-primary:hover { background: #6d28d9; transform: translateY(-1px); box-shadow: 0 4px 16px var(--glow); }
-  .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
-  .btn-ghost { background: var(--surface2); border: 1px solid var(--border); color: var(--text); }
-  .btn-ghost:hover { background: var(--surface3); }
-  .btn-danger { background: rgba(239,68,68,0.15); border: 1px solid rgba(239,68,68,0.3); color: #ef4444; }
-  .btn-danger:hover { background: #ef4444; color: white; }
-  .btn-warn { background: rgba(245,158,11,0.15); border: 1px solid rgba(245,158,11,0.3); color: var(--warn); }
-  .btn-sm { padding: 5px 12px; font-size: 12px; }
-  .btn-icon { width: 36px; height: 36px; padding: 0; display: flex; align-items: center; justify-content: center; border-radius: 8px; }
-
-  /* Theme toggle */
-  .theme-btn { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; width: 36px; height: 36px; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 16px; transition: background 0.15s; }
-  .theme-btn:hover { background: var(--surface3); }
-
-  /* Tabs */
-  .tabs { display: flex; gap: 4px; flex-wrap: wrap; }
-  .tab { background: none; border: 1px solid var(--border); border-radius: 20px; padding: 6px 16px; font-size: 13px; cursor: pointer; color: var(--muted); font-family: var(--font-body); transition: all 0.15s; white-space: nowrap; }
-  .tab.active { background: var(--accent); border-color: var(--accent); color: white; }
-  .tab:hover:not(.active) { background: var(--surface2); color: var(--text); }
-  .section-tabs { display: flex; gap: 0; margin-bottom: 16px; border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
-  .section-tab { flex: 1; background: none; border: none; padding: 10px; font-size: 13px; cursor: pointer; color: var(--muted); font-family: var(--font-display); font-weight: 600; transition: all 0.15s; white-space: nowrap; }
-  .section-tab.active { background: var(--accent); color: white; }
-  .section-tab:hover:not(.active) { background: var(--surface2); color: var(--text); }
-
-  /* Sidebar */
-  .sidebar-section { margin-bottom: 16px; }
-  .sidebar-title { font-family: var(--font-display); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; color: var(--muted); padding: 12px 16px 6px; }
-  .category-list { display: flex; flex-direction: column; }
-  .category-item { background: none; border: none; padding: 9px 16px; font-size: 13px; cursor: pointer; color: var(--muted); text-align: left; display: flex; align-items: center; gap: 8px; transition: background 0.15s; font-family: var(--font-body); }
-  .category-item:hover { background: var(--surface2); color: var(--text); }
-  .category-item.active { color: var(--text); background: var(--surface2); font-weight: 600; }
-  .cat-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-  .trending-list { padding: 4px 0; }
-  .trending-item { padding: 10px 16px; cursor: pointer; transition: background 0.15s; }
-  .trending-item:hover { background: var(--surface2); }
-  .trending-num { font-family: var(--font-display); font-size: 18px; font-weight: 800; color: var(--surface3); }
-  .trending-content { font-size: 12px; color: var(--muted); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
-  .trending-stats { font-size: 11px; color: var(--muted); margin-top: 4px; }
-
-  /* Modal */
-  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 200; display: flex; align-items: flex-start; justify-content: center; padding: 24px; overflow-y: auto; }
-  .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 20px; width: 100%; max-width: 640px; overflow: hidden; }
-  .modal-header { padding: 20px 24px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
-  .modal-title { font-family: var(--font-display); font-size: 16px; font-weight: 700; }
-  .modal-body { padding: 24px; max-height: 70vh; overflow-y: auto; }
-  .close-btn { background: var(--surface2); border: none; color: var(--muted); width: 32px; height: 32px; border-radius: 50%; cursor: pointer; font-size: 16px; display: flex; align-items: center; justify-content: center; transition: background 0.15s; }
-  .close-btn:hover { background: var(--surface3); color: var(--text); }
-
-  /* Comments */
-  .comment { padding: 14px 0; border-bottom: 1px solid var(--border); }
-  .comment:last-child { border-bottom: none; }
-  .comment-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
-  .comment-text { font-size: 14px; line-height: 1.6; color: var(--text); padding-left: 44px; white-space: pre-wrap; word-break: break-word; }
-  .comment-actions { display: flex; gap: 8px; padding-left: 44px; margin-top: 8px; flex-wrap: wrap; }
-  .comment-reply-form { padding-left: 44px; margin-top: 10px; }
-  .inline-input { width: 100%; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; color: var(--text); font-family: var(--font-body); font-size: 14px; }
-  .inline-input:focus { outline: none; border-color: var(--accent); }
-  .reply-indent { padding-left: 30px; border-left: 2px solid var(--border); margin-top: 10px; }
-
-  /* Notifications */
-  .notif-dot { width: 8px; height: 8px; background: var(--danger); border-radius: 50%; position: absolute; top: 4px; right: 4px; }
-  .notif-btn { position: relative; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; width: 36px; height: 36px; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 16px; }
-  .notif-panel { position: absolute; top: 100%; right: 0; margin-top: 8px; width: 320px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; box-shadow: var(--shadow); z-index: 150; }
-  .notif-header { padding: 14px 16px; border-bottom: 1px solid var(--border); font-family: var(--font-display); font-size: 13px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
-  .notif-item { padding: 12px 16px; border-bottom: 1px solid var(--border); cursor: pointer; transition: background 0.15s; }
-  .notif-item:hover { background: var(--surface2); }
-  .notif-item.unread { background: rgba(124,58,237,0.07); }
-  .notif-text { font-size: 13px; line-height: 1.5; }
-  .notif-time { font-size: 11px; color: var(--muted); margin-top: 2px; }
-
-  /* Admin */
-  .admin-page { max-width: 1100px; margin: 0 auto; padding: 24px 16px; }
-  .admin-header { margin-bottom: 28px; }
-  .admin-title { font-family: var(--font-display); font-size: 28px; font-weight: 800; }
-  .admin-subtitle { color: var(--muted); font-size: 14px; margin-top: 4px; }
-  .stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 16px; margin-bottom: 28px; }
-  .stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 16px; }
-  .stat-num { font-family: var(--font-display); font-size: 28px; font-weight: 800; }
-  .stat-label { font-size: 12px; color: var(--muted); margin-top: 2px; }
-
-  /* Chart */
-  .chart-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 20px; margin-bottom: 20px; }
-  .chart-title { font-family: var(--font-display); font-size: 14px; font-weight: 700; margin-bottom: 16px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
-  .bar-chart { display: flex; align-items: flex-end; gap: 8px; height: 120px; }
-  .bar-item { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px; }
-  .bar { width: 100%; background: linear-gradient(180deg, var(--accent), var(--accent2)); border-radius: 4px 4px 0 0; min-height: 4px; transition: height 0.5s ease; }
-  .bar-label { font-size: 10px; color: var(--muted); text-align: center; }
-  .bar-val { font-size: 10px; font-weight: 700; color: var(--text); }
-
-  .table-wrap { overflow-x: auto; }
-  table { width: 100%; border-collapse: collapse; }
-  th { text-align: left; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); padding: 10px 12px; border-bottom: 1px solid var(--border); font-family: var(--font-display); }
-  td { padding: 12px; border-bottom: 1px solid var(--border); font-size: 13px; vertical-align: top; }
-  tr:last-child td { border-bottom: none; }
-  .badge { font-size: 11px; font-weight: 600; padding: 3px 10px; border-radius: 20px; display: inline-block; }
-  .badge-danger { background: rgba(239,68,68,0.15); color: #ef4444; }
-  .badge-warn { background: rgba(245,158,11,0.15); color: #f59e0b; }
-  .badge-success { background: rgba(16,185,129,0.15); color: #10b981; }
-  .badge-purple { background: rgba(124,58,237,0.15); color: #a78bfa; }
-  .badge-cyan { background: rgba(6,182,212,0.15); color: #06b6d4; }
-
-  .empty { text-align: center; padding: 60px 20px; color: var(--muted); }
-  .empty-icon { font-size: 48px; margin-bottom: 12px; }
-  .empty-text { font-size: 15px; }
-
-  .alert { padding: 12px 16px; border-radius: var(--radius-sm); font-size: 13px; margin-bottom: 16px; }
-  .alert-error { background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.3); color: #fca5a5; }
-  .alert-success { background: rgba(16,185,129,0.1); border: 1px solid rgba(16,185,129,0.3); color: #6ee7b7; }
-  .alert-warn { background: rgba(245,158,11,0.1); border: 1px solid rgba(245,158,11,0.3); color: #fcd34d; }
-  .alert-info { background: rgba(6,182,212,0.1); border: 1px solid rgba(6,182,212,0.3); color: #67e8f9; }
-
-  .spinner { display: inline-block; width: 20px; height: 20px; border: 2px solid var(--surface3); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.6s linear infinite; }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  .loading-screen { display: flex; align-items: center; justify-content: center; min-height: 100vh; flex-direction: column; gap: 16px; }
-  .loading-logo { font-family: var(--font-display); font-size: 40px; font-weight: 800; }
-
-  .report-options { display: flex; flex-direction: column; gap: 8px; }
-  .report-option { display: flex; align-items: center; gap: 10px; padding: 12px; border: 1px solid var(--border); border-radius: 8px; cursor: pointer; transition: all 0.15s; }
-  .report-option:hover { border-color: var(--accent); background: var(--surface2); }
-  .report-option input[type=radio] { accent-color: var(--accent); }
-
-  .profile-menu { position: relative; }
-  .profile-btn { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 6px 12px; cursor: pointer; font-size: 13px; color: var(--text); font-family: var(--font-display); font-weight: 600; display: flex; align-items: center; gap: 6px; }
-  .profile-dropdown { position: absolute; top: 100%; right: 0; margin-top: 8px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; min-width: 180px; box-shadow: var(--shadow); z-index: 150; }
-  .dropdown-item { padding: 11px 16px; font-size: 14px; cursor: pointer; transition: background 0.15s; display: block; color: var(--text); border: none; background: none; width: 100%; text-align: left; font-family: var(--font-body); }
-  .dropdown-item:hover { background: var(--surface2); }
-  .dropdown-item.danger { color: var(--danger); }
-
-  @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
-  .fade-in { animation: fadeIn 0.25s ease; }
-
-  .search-bar { position: relative; flex: 1; max-width: 280px; }
-  .search-input { width: 100%; background: var(--surface2); border: 1px solid var(--border); border-radius: 20px; padding: 8px 16px 8px 36px; color: var(--text); font-family: var(--font-body); font-size: 13px; }
-  .search-input:focus { outline: none; border-color: var(--accent); }
-  .search-icon { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: var(--muted); font-size: 14px; pointer-events: none; }
-
-  .bookmarks-page { max-width: 700px; margin: 0 auto; padding: 24px 16px; }
-  .bookmarks-title { font-family: var(--font-display); font-size: 24px; font-weight: 800; margin-bottom: 20px; }
-
-  /* Auth */
-  .auth-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; background: var(--bg); }
-  .auth-card { background: var(--surface); border: 1px solid var(--border); border-radius: 24px; padding: 40px; width: 100%; max-width: 400px; }
-  .auth-logo { font-family: var(--font-display); font-size: 36px; font-weight: 800; text-align: center; margin-bottom: 8px; }
-  .auth-sub { text-align: center; color: var(--muted); font-size: 14px; margin-bottom: 32px; }
-  .auth-field { margin-bottom: 16px; }
-  .auth-label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
-  .auth-input { width: 100%; background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 14px; color: var(--text); font-family: var(--font-body); font-size: 14px; }
-  .auth-input:focus { outline: none; border-color: var(--accent); }
-
-  .glow-text { background: linear-gradient(135deg, #c084fc, #67e8f9); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
-
-  /* Profile page */
-  .profile-page { max-width: 700px; margin: 0 auto; padding: 24px 16px; }
-  .profile-header-card { padding: 28px; margin-bottom: 20px; display: flex; align-items: center; gap: 20px; flex-wrap: wrap; }
-  .profile-avatar-lg { width: 72px; height: 72px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 28px; font-weight: 800; font-family: var(--font-display); flex-shrink: 0; }
-  .profile-stat { text-align: center; padding: 0 16px; border-right: 1px solid var(--border); }
-  .profile-stat:last-child { border-right: none; }
-  .profile-stat-num { font-family: var(--font-display); font-size: 22px; font-weight: 800; }
-  .profile-stat-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; margin-top: 2px; }
-  .profile-post { padding: 16px; border-bottom: 1px solid var(--border); cursor: pointer; transition: background 0.15s; }
-  .profile-post:hover { background: var(--surface2); }
-  .profile-post:last-child { border-bottom: none; }
-  .profile-post-content { font-size: 14px; line-height: 1.6; color: var(--text); margin-bottom: 10px; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
-  .profile-post-stats { display: flex; gap: 16px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
-  .profile-post-stat { display: flex; align-items: center; gap: 4px; }
-
-  /* Maintenance */
-  .maintenance-screen { min-height: 100vh; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 16px; padding: 24px; text-align: center; }
-  .maintenance-icon { font-size: 64px; animation: spin 4s linear infinite; }
-  .maintenance-title { font-family: var(--font-display); font-size: 28px; font-weight: 800; }
-  .maintenance-sub { color: var(--muted); font-size: 15px; max-width: 400px; line-height: 1.7; }
-  .maintenance-toggle { position: fixed; bottom: 24px; right: 24px; background: var(--accent); color: white; border: none; border-radius: 12px; padding: 10px 20px; font-family: var(--font-display); font-weight: 700; font-size: 13px; cursor: pointer; box-shadow: 0 4px 20px var(--glow); z-index: 999; }
-  `;
-}
-
-function StyleTag({ theme }) {
-  return <style dangerouslySetInnerHTML={{ __html: buildStyles(theme) }} />;
-}
-function Spinner() { return <span className="spinner" />; }
 function Avatar({ username }) {
   const initials = username ? username.slice(0, 2).toUpperCase() : "?";
   const hue = username ? username.split("").reduce((a, c) => a + c.charCodeAt(0), 0) % 360 : 200;
@@ -693,8 +141,10 @@ function AuthPage({ theme, toggleTheme, onSignupSuccess }) {
   const [showTerms, setShowTerms] = useState(false);
   const [termsAccepted, setTermsAccepted] = useState(false);
 
+  const [blockedFp, setBlockedFp] = useState(null); // stores fp when blocked so user can share it with admin
+
   const doSignup = async () => {
-    setError(""); setLoading(true);
+    setError(""); setBlockedFp(null); setLoading(true);
     const normalizedEmail = email.trim().toLowerCase();
     if (!normalizedEmail) { setError("Please enter an email address."); setLoading(false); return; }
     if (password.length < 6) { setError("Password must be at least 6 characters."); setLoading(false); return; }
@@ -703,7 +153,7 @@ function AuthPage({ theme, toggleTheme, onSignupSuccess }) {
       const fp = getDeviceFingerprint();
 
       // Send signup request to backend — all validation happens server-side
-      const response = await fetch("https://web-production-549eb.up.railway.app/signup", {
+      const response = await fetch("https://whispr-v2-backend.onrender.com/signup", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -716,7 +166,12 @@ function AuthPage({ theme, toggleTheme, onSignupSuccess }) {
       const result = await response.json();
 
       if (!response.ok) {
-        setError(result.detail || "Something went wrong. Please try again.");
+        // If blocked due to device, show fingerprint so user can contact admin to whitelist
+        const msg = result.detail || "Something went wrong. Please try again.";
+        if (msg.toLowerCase().includes("device") || msg.toLowerCase().includes("account already")) {
+          setBlockedFp(fp);
+        }
+        setError(msg);
         setLoading(false); return;
       }
 
@@ -761,7 +216,18 @@ function AuthPage({ theme, toggleTheme, onSignupSuccess }) {
         <button className="theme-btn" style={{ marginLeft: "auto", display: "flex", marginBottom: 12 }} onClick={toggleTheme}>{theme === "dark" ? "☀️" : "🌙"}</button>
         <div className="auth-logo">wh<span style={{ color: "var(--accent)" }}>i</span>spr</div>
         <div className="auth-sub">{mode === "signup" ? "Create your anonymous account." : "Welcome back. Your secret is safe."}</div>
-        {error && <div className="alert alert-error">{error}</div>}
+        {error && (
+          <div className="alert alert-error">
+            {error}
+            {blockedFp && (
+              <div style={{ marginTop: 10, padding: 10, background: "rgba(0,0,0,0.2)", borderRadius: 8 }}>
+                <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4 }}>Your device code — share this with the admin to get unblocked:</div>
+                <div style={{ fontFamily: "monospace", fontSize: 11, wordBreak: "break-all", color: "var(--accent2)" }}>{blockedFp}</div>
+                <button onClick={() => { navigator.clipboard?.writeText(blockedFp); alert("Copied!"); }} style={{ marginTop: 6, background: "none", border: "1px solid var(--border)", color: "var(--muted)", borderRadius: 6, padding: "3px 10px", fontSize: 11, cursor: "pointer" }}>📋 Copy Code</button>
+              </div>
+            )}
+          </div>
+        )}
         {mode === "signup" && <div className="alert alert-info">✨ Use any email and a password of your choice. You'll get a random anonymous display name — no one will know it's you.</div>}
         <div className="auth-field">
           <label className="auth-label">Email</label>
@@ -770,7 +236,7 @@ function AuthPage({ theme, toggleTheme, onSignupSuccess }) {
         <div className="auth-field">
           <label className="auth-label">Password</label>
           <input className="auth-input" type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="••••••••" onKeyDown={e => e.key === "Enter" && handleAuth()} />
-          {mode === "signup" && <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>⚠️ Remember your email and password — if you forget them your account cannot be recovered.</div>}
+          {mode === "signup" && <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 4 }}>⚠️ Remember your email and password — if you forget them, contact support via the 💬 button.</div>}
         </div>
         {mode === "signup" && (
           <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 12, lineHeight: 1.6 }}>
@@ -781,7 +247,8 @@ function AuthPage({ theme, toggleTheme, onSignupSuccess }) {
         <button className="btn btn-primary" style={{ width: "100%", justifyContent: "center", marginTop: 8 }} onClick={handleAuth} disabled={loading}>
           {loading ? <Spinner /> : mode === "signup" ? "Create Anonymous Account" : "Sign In"}
         </button>
-        <div style={{ textAlign: "center", marginTop: 20, fontSize: 13, color: "var(--muted)" }}>
+
+        <div style={{ textAlign: "center", marginTop: 16, fontSize: 13, color: "var(--muted)" }}>
           {mode === "login" ? "New here?" : "Already have an account?"}{" "}
           <button onClick={() => { setMode(mode === "login" ? "signup" : "login"); setError(""); setTermsAccepted(false); setEmail(""); setPassword(""); }} style={{ background: "none", border: "none", color: "var(--accent)", cursor: "pointer", fontWeight: 600 }}>
             {mode === "login" ? "Sign Up" : "Log In"}
@@ -824,7 +291,7 @@ function ReactionButton({ postId, postUid, userReaction, reactions, currentUser,
     });
     try {
       const token = await auth.currentUser.getIdToken();
-      const response = await fetch("https://web-production-549eb.up.railway.app/react", {
+      const response = await fetch("https://whispr-v2-backend.onrender.com/react", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -857,7 +324,7 @@ function ReportModal({ type, targetId, targetUid, reporterUid, onClose }) {
     if (!reason) return;
     try {
       const token = await auth.currentUser.getIdToken();
-      const response = await fetch("https://web-production-549eb.up.railway.app/report", {
+      const response = await fetch("https://whispr-v2-backend.onrender.com/report", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -961,17 +428,20 @@ function CommentSection({ postId, currentUser, bannedWords }) {
   const [newComment, setNewComment] = useState(""); const [loading, setLoading] = useState(false);
   const [replyTo, setReplyTo] = useState(null); const [replyText, setReplyText] = useState("");
   const [report, setReport] = useState(null);
+  const [expandedReplies, setExpandedReplies] = useState({}); // track which comment's replies are open
+
   useEffect(() => {
     const q = query(collection(db, "comments"), where("postId", "==", postId), orderBy("createdAt", "asc"));
     return onSnapshot(q, snap => setComments(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
   }, [postId]);
+
   const addComment = async (parentId = null, text = newComment) => {
     if (!text.trim()) return;
     if (filterContent(text, bannedWords).blocked) { alert("Comment contains blocked content."); return; }
     setLoading(true);
     try {
       const token = await auth.currentUser.getIdToken();
-      const response = await fetch("https://web-production-549eb.up.railway.app/comment", {
+      const response = await fetch("https://whispr-v2-backend.onrender.com/comment", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -986,6 +456,8 @@ function CommentSection({ postId, currentUser, bannedWords }) {
       }
       if (parentId) {
         setReplyTo(null); setReplyText("");
+        // Auto-expand replies for this comment so the new reply is visible
+        setExpandedReplies(prev => ({ ...prev, [parentId]: true }));
       } else {
         setNewComment("");
       }
@@ -995,36 +467,129 @@ function CommentSection({ postId, currentUser, bannedWords }) {
       setLoading(false);
     }
   };
+
   const likeComment = async (c) => {
     const liked = c.likedBy?.includes(currentUser.uid);
-    await updateDoc(doc(db, "comments", c.id), { likes: increment(liked ? -1 : 1), likedBy: liked ? arrayRemove(currentUser.uid) : arrayUnion(currentUser.uid) });
+    // Optimistic update
+    setComments(prev => prev.map(x => x.id !== c.id ? x : {
+      ...x,
+      likes: Math.max(0, (x.likes || 0) + (liked ? -1 : 1)),
+      likedBy: liked
+        ? (x.likedBy || []).filter(id => id !== currentUser.uid)
+        : [...(x.likedBy || []), currentUser.uid],
+    }));
+    try {
+      await updateDoc(doc(db, "comments", c.id), {
+        likes: increment(liked ? -1 : 1),
+        likedBy: liked ? arrayRemove(currentUser.uid) : arrayUnion(currentUser.uid),
+      });
+    } catch (err) {
+      setComments(prev => prev.map(x => x.id !== c.id ? x : c));
+    }
   };
+
   const deleteComment = async (id) => {
     if (!window.confirm("Delete comment?")) return;
     await deleteDoc(doc(db, "comments", id));
     await updateDoc(doc(db, "posts", postId), { commentCount: increment(-1), score: increment(-3) });
   };
+
   const topLevel = comments.filter(c => !c.parentId);
-  const replies = (pid) => comments.filter(c => c.parentId === pid);
-  const renderComment = (c, isReply = false) => (
-    <div key={c.id} className="comment fade-in">
-      <div className="comment-header"><Avatar username={c.username} /><span className="username">{c.username}</span><span className="timestamp">{timeAgo(c.createdAt)}</span><span style={{ fontSize: 10, color: "var(--muted)", fontFamily: "monospace" }}>{c.commentId}</span></div>
-      <div className="comment-text">{c.text}</div>
-      <div className="comment-actions">
-        <button className={`action-btn btn-sm ${c.likedBy?.includes(currentUser.uid) ? "liked" : ""}`} onClick={() => likeComment(c)} style={{ padding: "4px 10px", fontSize: 12 }}>♥ {c.likes || 0}</button>
-        {!isReply && <button className="action-btn btn-sm" onClick={() => setReplyTo(replyTo === c.id ? null : c.id)} style={{ padding: "4px 10px", fontSize: 12 }}>↩ Reply</button>}
-        <button className="action-btn btn-sm" onClick={() => setReport({ type: "comment", id: c.id, uid: c.uid })} style={{ padding: "4px 10px", fontSize: 12 }}>⚑ Report</button>
-        {(c.uid === currentUser.uid || currentUser.role === "admin") && <button className="action-btn btn-sm" onClick={() => deleteComment(c.id)} style={{ padding: "4px 10px", fontSize: 12, color: "var(--danger)" }}>🗑</button>}
-      </div>
-      {replyTo === c.id && (
-        <div className="comment-reply-form" style={{ marginTop: 10 }}>
-          <input className="inline-input" placeholder={`Replying to ${c.username}...`} value={replyText} onChange={e => setReplyText(e.target.value)} onKeyDown={e => e.key === "Enter" && addComment(c.id, replyText)} />
-          <div style={{ display: "flex", gap: 8, marginTop: 8 }}><button className="btn btn-primary btn-sm" onClick={() => addComment(c.id, replyText)} disabled={!replyText.trim()}>Reply</button><button className="btn btn-ghost btn-sm" onClick={() => setReplyTo(null)}>Cancel</button></div>
+  const getReplies = (pid) => comments.filter(c => c.parentId === pid);
+
+  // Renders a single comment. depth controls indentation (0 = top, 1+ = reply)
+  const renderComment = (c, depth = 0) => {
+    const commentReplies = getReplies(c.id);
+    const isExpanded = expandedReplies[c.id];
+    const isReplying = replyTo === c.id;
+    const isLiked = c.likedBy?.includes(currentUser.uid);
+
+    return (
+      <div key={c.id} className="comment fade-in" style={{ marginLeft: depth > 0 ? 32 : 0, borderLeft: depth > 0 ? "2px solid var(--border)" : "none", paddingLeft: depth > 0 ? 12 : 0, marginTop: depth > 0 ? 10 : 0 }}>
+        <div className="comment-header">
+          <Avatar username={c.username} />
+          <span className="username">{c.username}</span>
+          <span className="timestamp">{timeAgo(c.createdAt)}</span>
+          <span style={{ fontSize: 10, color: "var(--muted)", fontFamily: "monospace" }}>{c.commentId}</span>
         </div>
-      )}
-      {replies(c.id).length > 0 && <div className="reply-indent" style={{ marginLeft: 44 }}>{replies(c.id).map(r => renderComment(r, true))}</div>}
-    </div>
-  );
+        <div className="comment-text">{c.text}</div>
+        <div className="comment-actions">
+          <button
+            className={`action-btn btn-sm ${isLiked ? "liked" : ""}`}
+            onClick={() => likeComment(c)}
+            style={{ padding: "4px 10px", fontSize: 12 }}
+          >
+            ♥ {c.likes || 0}
+          </button>
+          {/* Allow reply on both top-level and nested comments */}
+          <button
+            className="action-btn btn-sm"
+            onClick={() => { setReplyTo(isReplying ? null : c.id); setReplyText(""); }}
+            style={{ padding: "4px 10px", fontSize: 12 }}
+          >
+            ↩ Reply
+          </button>
+          <button className="action-btn btn-sm" onClick={() => setReport({ type: "comment", id: c.id, uid: c.uid })} style={{ padding: "4px 10px", fontSize: 12 }}>⚑ Report</button>
+          {(c.uid === currentUser.uid || currentUser.role === "admin") && (
+            <button className="action-btn btn-sm" onClick={() => deleteComment(c.id)} style={{ padding: "4px 10px", fontSize: 12, color: "var(--danger)" }}>🗑</button>
+          )}
+          {/* Collapse/expand toggle — shown only when there are replies */}
+          {commentReplies.length > 0 && (
+            <button
+              className="action-btn btn-sm"
+              onClick={() => setExpandedReplies(prev => ({ ...prev, [c.id]: !isExpanded }))}
+              style={{ padding: "4px 10px", fontSize: 12, color: "var(--accent)", marginLeft: "auto" }}
+            >
+              {isExpanded ? `▲ Hide ${commentReplies.length} ${commentReplies.length === 1 ? "reply" : "replies"}` : `▼ ${commentReplies.length} ${commentReplies.length === 1 ? "reply" : "replies"}`}
+            </button>
+          )}
+        </div>
+
+        {/* Reply input */}
+        {isReplying && (
+          <div className="comment-reply-form" style={{ marginTop: 10 }}>
+            <input
+              className="inline-input"
+              placeholder={`Replying to ${c.username}...`}
+              value={replyText}
+              onChange={e => setReplyText(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && addComment(c.id, replyText)}
+              autoFocus
+            />
+            <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+              <button className="btn btn-primary btn-sm" onClick={() => addComment(c.id, replyText)} disabled={!replyText.trim()}>Reply</button>
+              <button className="btn btn-ghost btn-sm" onClick={() => setReplyTo(null)}>Cancel</button>
+            </div>
+          </div>
+        )}
+
+        {/* Collapsed replies summary — shown when there are replies but collapsed */}
+        {commentReplies.length > 0 && !isExpanded && (
+          <div
+            style={{ marginLeft: 44, marginTop: 8, fontSize: 12, color: "var(--muted)", cursor: "pointer", display: "flex", alignItems: "center", gap: 6 }}
+            onClick={() => setExpandedReplies(prev => ({ ...prev, [c.id]: true }))}
+          >
+            <div style={{ display: "flex", marginRight: 4 }}>
+              {commentReplies.slice(0, 3).map((r, i) => (
+                <div key={r.id} style={{ width: 18, height: 18, borderRadius: "50%", background: `hsl(${r.username?.charCodeAt(0) * 15 || 0},65%,55%)`, border: "1px solid var(--surface)", marginLeft: i > 0 ? -6 : 0, fontSize: 8, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontWeight: 700 }}>
+                  {r.username?.slice(0, 1).toUpperCase()}
+                </div>
+              ))}
+            </div>
+            ▼ View {commentReplies.length} {commentReplies.length === 1 ? "reply" : "replies"}
+          </div>
+        )}
+
+        {/* Expanded replies — rendered recursively so reply-to-reply works */}
+        {commentReplies.length > 0 && isExpanded && (
+          <div style={{ marginTop: 8 }}>
+            {commentReplies.map(r => renderComment(r, depth + 1))}
+          </div>
+        )}
+      </div>
+    );
+  };
+
   return (
     <div>
       {report && <ReportModal type="comment" targetId={report.id} targetUid={report.uid} reporterUid={currentUser.uid} onClose={() => setReport(null)} />}
@@ -1032,7 +597,10 @@ function CommentSection({ postId, currentUser, bannedWords }) {
         <input className="inline-input" placeholder="Write a comment..." value={newComment} onChange={e => setNewComment(e.target.value)} onKeyDown={e => e.key === "Enter" && addComment()} />
         <button className="btn btn-primary" onClick={() => addComment()} disabled={loading || !newComment.trim()}>{loading ? <Spinner /> : "Post"}</button>
       </div>
-      {topLevel.length === 0 ? <div className="empty"><div className="empty-icon">💬</div><div className="empty-text">No comments yet.</div></div> : topLevel.map(c => renderComment(c))}
+      {topLevel.length === 0
+        ? <div className="empty"><div className="empty-icon">💬</div><div className="empty-text">No comments yet.</div></div>
+        : topLevel.map(c => renderComment(c, 0))
+      }
     </div>
   );
 }
@@ -1116,7 +684,7 @@ function PostCard({ post, currentUser, onOpen, allCategories, onBookmark, isBook
     });
     try {
       const token = await auth.currentUser.getIdToken();
-      const response = await fetch("https://web-production-549eb.up.railway.app/like", {
+      const response = await fetch("https://whispr-v2-backend.onrender.com/like", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1234,7 +802,7 @@ function ComposePost({ currentUser, allCategories, bannedWords, onNewPost }) {
       };
 
       // Send to backend instead of writing directly to Firestore
-      const response = await fetch("https://web-production-549eb.up.railway.app/post", {
+      const response = await fetch("https://whispr-v2-backend.onrender.com/post", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1250,6 +818,31 @@ function ComposePost({ currentUser, allCategories, bannedWords, onNewPost }) {
         return;
       }
 
+      // Build a local post object so the poster sees their post immediately
+      // without waiting for a Firestore read or the 60s poll
+      if (onNewPost) {
+        const localPost = {
+          id: result.postId || `local_${Date.now()}`,
+          postId: result.postId || "",
+          content: content.trim(),
+          uid: currentUser.uid,
+          username: currentUser.username,
+          category,
+          likes: 0,
+          likedBy: [],
+          reactions: {},
+          userReactions: {},
+          commentCount: 0,
+          reported: false,
+          deleted: false,
+          pinned: false,
+          score: 0,
+          disappearing: isDisappearing,
+          createdAt: { toDate: () => new Date(), seconds: Math.floor(Date.now() / 1000) },
+          ...(isPoll ? { poll: { labels: pollOptions.filter(o => o.trim()), options: Object.fromEntries(pollOptions.filter(o => o.trim()).map((_, i) => [i, 0])), votes: {} } } : {}),
+        };
+        onNewPost(localPost);
+      }
       setContent(""); setPollOptions(["", ""]); setIsPoll(false); setIsDisappearing(false);
       startCooldown(Math.ceil(POST_COOLDOWN_MS / 1000));
     } catch (err) {
@@ -1380,11 +973,23 @@ function SupportButton({ currentUser }) {
 
 function NotificationBell({ currentUser }) {
   const [notifs, setNotifs] = useState([]); const [open, setOpen] = useState(false); const ref = useRef();
-  useEffect(() => {
+
+  const fetchNotifs = useCallback(async () => {
     if (!currentUser?.uid) return;
-    const q = query(collection(db, "notifications"), where("toUid", "==", currentUser.uid), orderBy("createdAt", "desc"), limit(30));
-    return onSnapshot(q, snap => setNotifs(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
+    try {
+      const q = query(collection(db, "notifications"), where("toUid", "==", currentUser.uid), orderBy("createdAt", "desc"), limit(30));
+      const snap = await getDocs(q);
+      setNotifs(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+    } catch (_) {}
   }, [currentUser?.uid]);
+
+  // Fetch on mount, then every 2 minutes — much cheaper than onSnapshot
+  useEffect(() => {
+    fetchNotifs();
+    const interval = setInterval(fetchNotifs, 2 * 60 * 1000);
+    return () => clearInterval(interval);
+  }, [fetchNotifs]);
+
   useEffect(() => {
     const h = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
     document.addEventListener("mousedown", h); return () => document.removeEventListener("mousedown", h);
@@ -1411,7 +1016,7 @@ function NotificationBell({ currentUser }) {
   };
   return (
     <div ref={ref} style={{ position: "relative" }}>
-      <button className="notif-btn" onClick={() => { setOpen(o => !o); if (!open) markRead(); }}>🔔{unread > 0 && <span className="notif-dot" />}</button>
+      <button className="notif-btn" onClick={() => { setOpen(o => !o); if (!open) { markRead(); fetchNotifs(); } }}>🔔{unread > 0 && <span className="notif-dot" />}</button>
       {open && (
         <div className="notif-panel fade-in">
           <div className="notif-header">Notifications {unread > 0 && `(${unread})`}</div>
@@ -1474,19 +1079,76 @@ function AdminPanel({ currentUser, allCategories, setAllCategories }) {
   const [newCatLabel, setNewCatLabel] = useState(""); const [newCatColor, setNewCatColor] = useState("#74b9ff");
   const [supportMsgs, setSupportMsgs] = useState([]);
   const [maintenance, setMaintenance] = useState(false);
+  const [ads, setAds] = useState([]);
   const [deviceBans, setDeviceBans] = useState([]);
+  const [deviceWhitelist, setDeviceWhitelist] = useState([]);
+  const [newWhitelistFp, setNewWhitelistFp] = useState("");
+  const [newWhitelistNote, setNewWhitelistNote] = useState("");
+  const [userSearch, setUserSearch] = useState("");
 
-  useEffect(() => {
-    const u1 = onSnapshot(query(collection(db, "reports"), orderBy("createdAt", "desc")), snap => setReports(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
-    const u2 = onSnapshot(query(collection(db, "posts"), where("deleted", "==", false), orderBy("createdAt", "desc"), limit(50)), snap => setPosts(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
-    const u3 = onSnapshot(collection(db, "users"), snap => setUsers(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
-    const u4 = onSnapshot(query(collection(db, "announcements"), orderBy("createdAt", "desc")), snap => setAnnouncements(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
-    const u5 = onSnapshot(query(collection(db, "support"), orderBy("createdAt", "desc")), snap => setSupportMsgs(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
-    const u6 = onSnapshot(collection(db, "deviceBans"), snap => setDeviceBans(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
-    getDoc(doc(db, "settings", "keywords")).then(snap => { if (snap.exists() && snap.data().words) setBannedWords(snap.data().words); });
-    getDoc(doc(db, "settings", "maintenance")).then(snap => { if (snap.exists()) setMaintenance(snap.data().enabled || false); });
-    return () => { u1(); u2(); u3(); u4(); u5(); u6(); };
+  // ── Lazy-load admin data per tab — massive read saving ──────────────────────
+  // Previously: 7 live listeners open simultaneously = hundreds of reads/minute
+  // Now: each tab fetches its own data once when opened, with a manual refresh
+  const [adminLoading, setAdminLoading] = useState(false);
+  const loadedTabs = useRef(new Set()); // track which tabs have been loaded
+
+  const loadTabData = useCallback(async (tabName, force = false) => {
+    if (!force && loadedTabs.current.has(tabName)) return; // already loaded
+    setAdminLoading(true);
+    try {
+      if (tabName === "dashboard" || tabName === "reports") {
+        const snap = await getDocs(query(collection(db, "reports"), orderBy("createdAt", "desc")));
+        setReports(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+      }
+      if (tabName === "dashboard" || tabName === "posts") {
+        const snap = await getDocs(query(collection(db, "posts"), where("deleted", "==", false), orderBy("createdAt", "desc"), limit(50)));
+        setPosts(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+      }
+      if (tabName === "dashboard" || tabName === "users" || tabName === "duplicates") {
+        const snap = await getDocs(collection(db, "users"));
+        setUsers(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+      }
+      if (tabName === "announcements") {
+        const snap = await getDocs(query(collection(db, "announcements"), orderBy("createdAt", "desc")));
+        setAnnouncements(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+      }
+      if (tabName === "support") {
+        const snap = await getDocs(query(collection(db, "support"), orderBy("createdAt", "desc")));
+        setSupportMsgs(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+      }
+      if (tabName === "devices") {
+        const snap = await getDocs(collection(db, "deviceBans"));
+        setDeviceBans(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+      }
+      if (tabName === "whitelist") {
+        const snap = await getDocs(collection(db, "deviceWhitelist"));
+        setDeviceWhitelist(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+      }
+      if (tabName === "ads") {
+        const snap = await getDocs(query(collection(db, "ads"), orderBy("submittedAt", "desc")));
+        setAds(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+      }
+      if (tabName === "keywords") {
+        const snap = await getDoc(doc(db, "settings", "keywords"));
+        if (snap.exists() && snap.data().words) setBannedWords(snap.data().words);
+      }
+      if (tabName === "categories") {
+        // categories already loaded from Feed — nothing extra needed
+      }
+      if (tabName === "dashboard") {
+        const snap = await getDoc(doc(db, "settings", "maintenance"));
+        if (snap.exists()) setMaintenance(snap.data().enabled || false);
+        // Also load announcements for dashboard
+        const aSnap = await getDocs(query(collection(db, "announcements"), orderBy("createdAt", "desc")));
+        setAnnouncements(aSnap.docs.map(d => ({ id: d.id, ...d.data() })));
+      }
+      loadedTabs.current.add(tabName);
+    } finally { setAdminLoading(false); }
   }, []);
+
+  // Load dashboard on mount, then load each tab when switched to
+  useEffect(() => { loadTabData("dashboard"); }, [loadTabData]);
+  useEffect(() => { loadTabData(tab); }, [tab, loadTabData]);
 
   const saveKeywords = async (words) => { await setDoc(doc(db, "settings", "keywords"), { words }); };
   const toggleMaintenance = async () => {
@@ -1503,7 +1165,7 @@ function AdminPanel({ currentUser, allCategories, setAllCategories }) {
       const token = await auth.currentUser.getIdToken();
       const ms = parseInt(banDuration) * (banUnit === "hours" ? 3600000 : banUnit === "days" ? 86400000 : 604800000);
       const durationDays = ms / 86400000;
-      const response = await fetch("https://web-production-549eb.up.railway.app/admin/ban", {
+      const response = await fetch("https://whispr-v2-backend.onrender.com/admin/ban", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1530,7 +1192,7 @@ function AdminPanel({ currentUser, allCategories, setAllCategories }) {
   const unbanUser = async (u) => {
     try {
       const token = await auth.currentUser.getIdToken();
-      const response = await fetch("https://web-production-549eb.up.railway.app/admin/unban", {
+      const response = await fetch("https://whispr-v2-backend.onrender.com/admin/unban", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1546,6 +1208,24 @@ function AdminPanel({ currentUser, allCategories, setAllCategories }) {
       alert("Failed to unban user. Please check your connection.");
     }
   };
+
+  const deleteAccount = async (u) => {
+    if (!window.confirm(`PERMANENTLY DELETE account "${u.username}"?\n\nThis will remove ALL their posts, comments, and account data. This cannot be undone.`)) return;
+    try {
+      const token = await auth.currentUser.getIdToken();
+      const response = await fetch("https://whispr-v2-backend.onrender.com/admin/delete-account", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
+        body: JSON.stringify({ targetUid: u.uid }),
+      });
+      const result = await response.json();
+      if (!response.ok) { alert(result.detail || "Failed to delete account."); return; }
+      alert(`Account "${u.username}" and all their data has been deleted.`);
+    } catch (e) {
+      alert("Failed to delete account. Please check your connection.");
+    }
+  };
+
   const deletePost = async (id) => { if (!window.confirm("Delete post?")) return; await updateDoc(doc(db, "posts", id), { deleted: true }); };
   const resolveReport = async (id) => { await updateDoc(doc(db, "reports", id), { status: "resolved" }); };
   const dismissReport = async (id) => { await updateDoc(doc(db, "reports", id), { status: "dismissed" }); };
@@ -1588,9 +1268,19 @@ function AdminPanel({ currentUser, allCategories, setAllCategories }) {
 
   return (
     <div className="admin-page fade-in">
-      <div className="admin-header">
-        <div className="admin-title">⚙️ Admin Panel</div>
-        <div className="admin-subtitle">Logged in as {currentUser.username}</div>
+      <div className="admin-header" style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 12 }}>
+        <div>
+          <div className="admin-title">⚙️ Admin Panel</div>
+          <div className="admin-subtitle">Logged in as {currentUser.username}</div>
+        </div>
+        <button
+          className="btn btn-ghost btn-sm"
+          onClick={() => { loadedTabs.current.delete(tab); loadTabData(tab, true); }}
+          disabled={adminLoading}
+          style={{ alignSelf: "center" }}
+        >
+          {adminLoading ? <Spinner /> : "🔄 Refresh"}
+        </button>
       </div>
       <div className="stats-grid">
         <div className="stat-card"><div className="stat-num" style={{ color: "var(--accent)" }}>{posts.length}</div><div className="stat-label">Total Posts</div></div>
@@ -1602,13 +1292,13 @@ function AdminPanel({ currentUser, allCategories, setAllCategories }) {
         <div className="stat-card"><div className="stat-num" style={{ color: "var(--accent)" }}>{supportMsgs.filter(m => m.status === "open").length}</div><div className="stat-label">Support Msgs</div></div>
       </div>
       <div className="tabs admin-tabs-desktop" style={{ marginBottom: 24 }}>
-        {[["dashboard","📊 Dashboard"],["reports","🚨 Reports"],["posts","📝 Posts"],["users","👥 Users"],["duplicates","🔍 Duplicate Devices"],["keywords","🚫 Keywords"],["categories","🏷️ Categories"],["announcements","📢 Announcements"],["support","💬 Support"],["devices","🖥️ Device Bans"]].map(([id, label]) =>
+        {[["dashboard","📊 Dashboard"],["reports","🚨 Reports"],["posts","📝 Posts"],["users","👥 Users"],["duplicates","🔍 Duplicate Devices"],["keywords","🚫 Keywords"],["categories","🏷️ Categories"],["announcements","📢 Announcements"],["support","💬 Support"],["devices","🖥️ Device Bans"],["whitelist","✅ Whitelist"],["ads","💰 Ads"]].map(([id, label]) =>
           <button key={id} className={`tab ${tab === id ? "active" : ""}`} onClick={() => setTab(id)}>{label}</button>
         )}
       </div>
       {/* Mobile: dropdown instead of tabs */}
       <select className="admin-tabs-mobile" value={tab} onChange={e => setTab(e.target.value)}>
-        {[["dashboard","📊 Dashboard"],["reports","🚨 Reports"],["posts","📝 Posts"],["users","👥 Users"],["duplicates","🔍 Duplicate Devices"],["keywords","🚫 Keywords"],["categories","🏷️ Categories"],["announcements","📢 Announcements"],["support","💬 Support"],["devices","🖥️ Device Bans"]].map(([id, label]) =>
+        {[["dashboard","📊 Dashboard"],["reports","🚨 Reports"],["posts","📝 Posts"],["users","👥 Users"],["duplicates","🔍 Duplicate Devices"],["keywords","🚫 Keywords"],["categories","🏷️ Categories"],["announcements","📢 Announcements"],["support","💬 Support"],["devices","🖥️ Device Bans"],["whitelist","✅ Whitelist"],["ads","💰 Ads"]].map(([id, label]) =>
           <option key={id} value={id}>{label}</option>
         )}
       </select>
@@ -1721,10 +1411,32 @@ function AdminPanel({ currentUser, allCategories, setAllCategories }) {
       )}
 
       {tab === "users" && (
+        <div>
+          <div style={{ marginBottom: 12, display: "flex", gap: 10, alignItems: "center" }}>
+            <input
+              className="inline-input"
+              placeholder="🔍 Search by username or email..."
+              value={userSearch}
+              onChange={e => setUserSearch(e.target.value)}
+              style={{ flex: 1, maxWidth: 360 }}
+            />
+            {userSearch && (
+              <button className="btn btn-ghost btn-sm" onClick={() => setUserSearch("")}>✕ Clear</button>
+            )}
+            <span style={{ fontSize: 12, color: "var(--muted)" }}>
+              {users.filter(u => {
+                const s = userSearch.toLowerCase();
+                return !s || u.username?.toLowerCase().includes(s) || u.email?.toLowerCase().includes(s);
+              }).length} of {users.length} users
+            </span>
+          </div>
         <div className="card"><div className="table-wrap admin-table-wrap"><table>
-          <thead><tr><th>Display Name</th><th>Email</th><th>Role</th><th>Status</th><th>Last Seen</th><th>Device FP</th><th>Actions</th></tr></thead>
+          <thead><tr><th>Display Name</th><th>Role</th><th>Status</th><th>Last Seen</th><th>Device FP</th><th>Actions</th></tr></thead>
           <tbody>
-            {users.map(u => {
+            {users.filter(u => {
+              const s = userSearch.toLowerCase();
+              return !s || u.username?.toLowerCase().includes(s) || u.email?.toLowerCase().includes(s);
+            }).map(u => {
               const lastSeen = u.lastSeen?.toDate?.();
               const minsAgo = lastSeen ? (Date.now() - lastSeen.getTime()) / 60000 : null;
               const isOnline = minsAgo !== null && minsAgo < 3; // online if seen within last 3 mins
@@ -1742,7 +1454,6 @@ function AdminPanel({ currentUser, allCategories, setAllCategories }) {
               return (
                 <tr key={u.id}>
                   <td><div style={{ display: "flex", alignItems: "center", gap: 8 }}><Avatar username={u.username} />{u.username}</div></td>
-                  <td style={{ fontSize: 11, color: "var(--muted)", maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{u.email || "—"}</td>
                   <td><span className={`badge ${u.role === "admin" ? "badge-purple" : "badge-success"}`}>{u.role || "user"}</span></td>
                   <td>
                     <span className={`badge ${status.cls}`}>{status.label}</span>
@@ -1770,6 +1481,7 @@ function AdminPanel({ currentUser, allCategories, setAllCategories }) {
             })}
           </tbody>
         </table></div></div>
+        </div>
       )}
 
       {tab === "duplicates" && (() => {
@@ -1843,12 +1555,17 @@ function AdminPanel({ currentUser, allCategories, setAllCategories }) {
                             : <span style={{ fontSize: 11, color: "#fca5a5", fontWeight: 700 }}>⚠️ Duplicate</span>}
                           </td>
                           <td>
-                            {u.uid !== currentUser.uid && !u.banned && i !== 0 && (
-                              <button className="btn btn-danger btn-sm" onClick={() => { setBanModal(u); setBanDuration("30"); setBanUnit("days"); setBanReason("Duplicate account — only one account per device is allowed."); }}>Ban</button>
-                            )}
-                            {u.uid !== currentUser.uid && u.banned && (
-                              <button className="btn btn-ghost btn-sm" onClick={() => unbanUser(u)}>Unban</button>
-                            )}
+                            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                              {u.uid !== currentUser.uid && !u.banned && i !== 0 && (
+                                <button className="btn btn-danger btn-sm" onClick={() => { setBanModal(u); setBanDuration("30"); setBanUnit("days"); setBanReason("Duplicate account — only one account per device is allowed."); }}>🔨 Ban</button>
+                              )}
+                              {u.uid !== currentUser.uid && u.banned && (
+                                <button className="btn btn-ghost btn-sm" onClick={() => unbanUser(u)}>Unban</button>
+                              )}
+                              {u.uid !== currentUser.uid && (
+                                <button className="btn btn-sm" style={{ background: "rgba(239,68,68,0.15)", color: "#fca5a5", border: "1px solid rgba(239,68,68,0.3)" }} onClick={() => deleteAccount(u)}>🗑️ Delete</button>
+                              )}
+                            </div>
                           </td>
                         </tr>
                       ))}
@@ -1947,6 +1664,72 @@ function AdminPanel({ currentUser, allCategories, setAllCategories }) {
         </div>
       )}
 
+      {tab === "whitelist" && (
+        <div>
+          <div className="card card-pad" style={{ marginBottom: 16 }}>
+            <div style={{ fontFamily: "var(--font-display)", fontWeight: 800, fontSize: 18, marginBottom: 6 }}>✅ Device Whitelist</div>
+            <div style={{ fontSize: 13, color: "var(--muted)", lineHeight: 1.7, marginBottom: 16 }}>
+              Whitelisted devices are allowed to create a new account even if they were previously flagged as a duplicate or banned device.
+              Use this when a genuine new user is wrongly blocked — ask them to share their device fingerprint from the signup error screen, then add it here.
+            </div>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
+              <input
+                className="inline-input"
+                placeholder="Device fingerprint (e.g. fp_abc123)"
+                value={newWhitelistFp}
+                onChange={e => setNewWhitelistFp(e.target.value)}
+                style={{ flex: 1, minWidth: 200 }}
+              />
+              <input
+                className="inline-input"
+                placeholder="Note (e.g. new student, shared device)"
+                value={newWhitelistNote}
+                onChange={e => setNewWhitelistNote(e.target.value)}
+                style={{ flex: 1, minWidth: 160 }}
+              />
+              <button
+                className="btn btn-primary"
+                disabled={!newWhitelistFp.trim()}
+                onClick={async () => {
+                  const fp = newWhitelistFp.trim();
+                  if (!fp) return;
+                  const already = deviceWhitelist.find(w => w.fingerprint === fp);
+                  if (already) { alert("This fingerprint is already whitelisted."); return; }
+                  await addDoc(collection(db, "deviceWhitelist"), {
+                    fingerprint: fp,
+                    note: newWhitelistNote.trim() || "—",
+                    addedBy: currentUser.username,
+                    createdAt: serverTimestamp(),
+                  });
+                  setNewWhitelistFp(""); setNewWhitelistNote("");
+                  alert("✅ Device whitelisted. That user can now sign up.");
+                }}
+              >
+                Add to Whitelist
+              </button>
+            </div>
+          </div>
+          {deviceWhitelist.length === 0 ? (
+            <div className="empty"><div className="empty-icon">✅</div><div className="empty-text">No whitelisted devices yet. Add one above when a genuine user is blocked.</div></div>
+          ) : (
+            <div className="card"><div className="table-wrap admin-table-wrap"><table>
+              <thead><tr><th>Fingerprint</th><th>Note</th><th>Added By</th><th>Date</th><th>Actions</th></tr></thead>
+              <tbody>
+                {deviceWhitelist.map(w => (
+                  <tr key={w.id}>
+                    <td style={{ fontFamily: "monospace", fontSize: 11, color: "var(--accent2)" }}>{w.fingerprint}</td>
+                    <td style={{ fontSize: 13, color: "var(--muted)" }}>{w.note}</td>
+                    <td style={{ fontSize: 12 }}>{w.addedBy}</td>
+                    <td style={{ fontSize: 12, color: "var(--muted)" }}>{timeAgo(w.createdAt)}</td>
+                    <td><button className="btn btn-danger btn-sm" onClick={() => deleteDoc(doc(db, "deviceWhitelist", w.id))}>Remove</button></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table></div></div>
+          )}
+        </div>
+      )}
+
       {tab === "support" && (
         <div>
           <div style={{ fontFamily: "var(--font-display)", fontSize: 16, fontWeight: 800, marginBottom: 16 }}>
@@ -1973,6 +1756,80 @@ function AdminPanel({ currentUser, allCategories, setAllCategories }) {
                   )}
                   <button className="btn btn-danger btn-sm" onClick={() => deleteDoc(doc(db, "support", m.id))}>Delete</button>
                 </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {tab === "ads" && (
+        <div>
+          <div style={{ fontFamily: "var(--font-display)", fontSize: 16, fontWeight: 800, marginBottom: 4 }}>
+            💰 Sponsored Ads
+          </div>
+          <div style={{ fontSize: 13, color: "var(--muted)", marginBottom: 20 }}>
+            Review ad submissions from businesses. Approved ads appear at the top of the student feed.
+            Share this link with businesses: <span style={{ color: "var(--accent)", fontFamily: "monospace", fontSize: 12 }}>whispr-app.netlify.app/ad-submit.html</span>
+          </div>
+
+          {ads.length === 0 ? (
+            <div className="empty"><div className="empty-icon">📢</div><div className="empty-text">No ad submissions yet.</div></div>
+          ) : ads.map(ad => (
+            <div key={ad.id} className="card card-pad" style={{
+              marginBottom: 12,
+              border: ad.status === "approved" ? "1px solid rgba(16,185,129,0.35)"
+                    : ad.status === "rejected" ? "1px solid rgba(239,68,68,0.2)"
+                    : "1px solid rgba(124,58,237,0.3)",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8, flexWrap: "wrap" }}>
+                    <strong style={{ fontSize: 15 }}>{ad.businessName}</strong>
+                    <span style={{
+                      fontSize: 11, padding: "2px 10px", borderRadius: 99, fontWeight: 700,
+                      background: ad.status === "approved" ? "rgba(16,185,129,0.15)"
+                                : ad.status === "rejected" ? "rgba(239,68,68,0.12)" : "rgba(124,58,237,0.15)",
+                      color: ad.status === "approved" ? "var(--success)"
+                           : ad.status === "rejected" ? "var(--danger)" : "var(--accent)",
+                    }}>
+                      {ad.status.toUpperCase()}
+                    </span>
+                    <span style={{ fontSize: 12, color: "var(--muted)" }}>{timeAgo(ad.submittedAt)}</span>
+                  </div>
+                  <p style={{ fontSize: 14, lineHeight: 1.6, marginBottom: 8, color: "var(--text)" }}>{ad.adText}</p>
+                  <div style={{ fontSize: 12, color: "var(--muted)", display: "flex", gap: 16, flexWrap: "wrap" }}>
+                    <span>✉️ {ad.contactEmail}</span>
+                    {ad.link && <a href={ad.link} target="_blank" rel="noopener noreferrer" style={{ color: "var(--accent)" }}>{ad.link}</a>}
+                  </div>
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 8, marginTop: 14, flexWrap: "wrap" }}>
+                {ad.status !== "approved" && (
+                  <button className="btn btn-sm" style={{ background: "rgba(16,185,129,0.15)", color: "var(--success)", border: "1px solid rgba(16,185,129,0.3)" }}
+                    onClick={async () => {
+                      await updateDoc(doc(db, "ads", ad.id), { status: "approved" });
+                      setAds(prev => prev.map(a => a.id === ad.id ? { ...a, status: "approved" } : a));
+                    }}>
+                    ✅ Approve
+                  </button>
+                )}
+                {ad.status !== "rejected" && (
+                  <button className="btn btn-danger btn-sm"
+                    onClick={async () => {
+                      await updateDoc(doc(db, "ads", ad.id), { status: "rejected" });
+                      setAds(prev => prev.map(a => a.id === ad.id ? { ...a, status: "rejected" } : a));
+                    }}>
+                    ✕ Reject
+                  </button>
+                )}
+                <button className="btn btn-ghost btn-sm"
+                  onClick={async () => {
+                    if (!window.confirm("Permanently delete this ad submission?")) return;
+                    await deleteDoc(doc(db, "ads", ad.id));
+                    setAds(prev => prev.filter(a => a.id !== ad.id));
+                  }}>
+                  🗑 Delete
+                </button>
               </div>
             </div>
           ))}
@@ -2154,6 +2011,7 @@ function BookmarksPage({ currentUser, bookmarks, allCategories, bannedWords, isA
 
 // ─── MAIN FEED ────────────────────────────────────────────────────────────────
 function Feed({ currentUser, isAdmin, theme, toggleTheme, maintenanceMode }) {
+  const pushToast = useForegroundPush();
   const [posts, setPosts] = useState([]);
   const [section, setSection] = useState("latest");
   const [feedTab, setFeedTab] = useState("newest");
@@ -2170,8 +2028,10 @@ function Feed({ currentUser, isAdmin, theme, toggleTheme, maintenanceMode }) {
   const [bannedWords, setBannedWords] = useState([...DEFAULT_BANNED_KEYWORDS]);
   const [announcements, setAnnouncements] = useState([]);
   const [randomSeed, setRandomSeed] = useState(0);
+  const [composeOpen, setComposeOpen] = useState(false);
   const [globalTrending, setGlobalTrending] = useState([]);       // platform-wide top by score
   const [globalMostCommented, setGlobalMostCommented] = useState([]); // platform-wide top by comments
+  const [sponsoredAd, setSponsoredAd] = useState(null); // sponsored ad shown at top of feed
   // True Firestore pagination state
   const PAGE_SIZE = 20;
   const [lastDoc, setLastDoc] = useState(null);       // cursor for "load older"
@@ -2186,34 +2046,59 @@ function Feed({ currentUser, isAdmin, theme, toggleTheme, maintenanceMode }) {
     document.addEventListener("mousedown", h); return () => document.removeEventListener("mousedown", h);
   }, []);
 
-  // Heartbeat — writes lastSeen every 2 minutes so admin panel shows accurate online status
+  // Heartbeat — writes lastSeen every 5 minutes (reduced from 2min to save writes)
   useEffect(() => {
     const write = () => updateDoc(doc(db, "users", currentUser.uid), { lastSeen: serverTimestamp() });
-    write(); // write immediately on load
-    const interval = setInterval(write, 2 * 60 * 1000);
+    write();
+    const interval = setInterval(write, 5 * 60 * 1000);
     return () => clearInterval(interval);
   }, [currentUser.uid]);
 
-  // Categories via live onSnapshot — admin changes appear everywhere instantly
+  // One-time fetch on load — no live listeners to avoid burning Firestore reads.
+  // User must manually refresh (via 🔄 button) to see updates. This is intentional.
   useEffect(() => {
-    const unsubCats = onSnapshot(doc(db, "settings", "categories"), snap => {
-      if (snap.exists() && snap.data().list) setAllCategories(snap.data().list);
-    });
-    getDoc(doc(db, "settings", "keywords")).then(snap => { if (snap.exists() && snap.data().words) setBannedWords(snap.data().words); });
-    const unsubAnnounce = onSnapshot(query(collection(db, "announcements"), orderBy("createdAt", "desc")), snap =>
-      setAnnouncements(snap.docs.map(d => ({ id: d.id, ...d.data() })).filter(a => a.active !== false))
-    );
-    // Platform-wide trending — top 20 by score across ALL posts, live
-    const unsubTrending = onSnapshot(
-      query(collection(db, "posts"), where("deleted", "==", false), orderBy("score", "desc"), limit(20)),
-      snap => setGlobalTrending(snap.docs.map(d => ({ id: d.id, ...d.data() })))
-    );
-    // Platform-wide most discussed — top 20 by commentCount across ALL posts, live
-    const unsubMostCommented = onSnapshot(
-      query(collection(db, "posts"), where("deleted", "==", false), orderBy("commentCount", "desc"), limit(20)),
-      snap => setGlobalMostCommented(snap.docs.map(d => ({ id: d.id, ...d.data() })))
-    );
-    return () => { unsubCats(); unsubAnnounce(); unsubTrending(); unsubMostCommented(); };
+    const fetchStaticData = async () => {
+      try {
+        // Categories
+        const catSnap = await getDoc(doc(db, "settings", "categories"));
+        if (catSnap.exists() && catSnap.data().list) setAllCategories(catSnap.data().list);
+      } catch (_) {}
+      try {
+        // Banned keywords
+        const kwSnap = await getDoc(doc(db, "settings", "keywords"));
+        if (kwSnap.exists() && kwSnap.data().words) setBannedWords(kwSnap.data().words);
+      } catch (_) {}
+      try {
+        // Announcements
+        const annSnap = await getDocs(query(collection(db, "announcements"), orderBy("createdAt", "desc")));
+        setAnnouncements(annSnap.docs.map(d => ({ id: d.id, ...d.data() })).filter(a => a.active !== false));
+      } catch (_) {}
+      try {
+        // Trending — fetched once, refreshed only when user taps 🔄
+        const trendSnap = await getDocs(query(collection(db, "posts"), where("deleted", "==", false), orderBy("score", "desc"), limit(20)));
+        setGlobalTrending(trendSnap.docs.map(d => ({ id: d.id, ...d.data() })));
+      } catch (_) {}
+      try {
+        // Most discussed — same, one-time fetch
+        const commSnap = await getDocs(query(collection(db, "posts"), where("deleted", "==", false), orderBy("commentCount", "desc"), limit(20)));
+        setGlobalMostCommented(commSnap.docs.map(d => ({ id: d.id, ...d.data() })));
+      } catch (_) {}
+    };
+    fetchStaticData();
+  }, []);
+
+  // Fetch one random approved sponsored ad on load
+  useEffect(() => {
+    const fetchAd = async () => {
+      try {
+        const snap = await getDocs(query(collection(db, "ads"), where("status", "==", "approved")));
+        const approved = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+        if (approved.length > 0) {
+          setSponsoredAd(approved[Math.floor(Math.random() * approved.length)]);
+        }
+      } catch (_) {} // ads are optional — never break the feed
+    };
+    fetchAd();
   }, []);
 
   // ── Build a base Firestore query (no cursor) ────────────────────────────────
@@ -2222,13 +2107,20 @@ function Feed({ currentUser, isAdmin, theme, toggleTheme, maintenanceMode }) {
     return query(collection(db, "posts"), where("deleted", "==", false), orderBy("createdAt", "desc"), limit(PAGE_SIZE + 1));
   }, []);
 
-  // ── Live listener for current page — likes/reactions/new posts update instantly ─
-  useEffect(() => {
+  // ── Fetch feed with getDocs (saves reads vs onSnapshot) ────────────────────
+  // onSnapshot was draining quota — it re-read ALL posts every time any field
+  // changed (likes, reactions etc). Now we fetch once and refresh manually.
+  const [newPostsAvailable, setNewPostsAvailable] = useState(false);
+  const latestPostCreatedAt = useRef(null); // track newest post timestamp
+
+  const fetchFeed = useCallback(async (cat = activeCategory) => {
     setLoading(true);
     setHasNewer(false);
     setPageNum(1);
-    const q = buildBaseQuery(activeCategory);
-    const unsub = onSnapshot(q, snap => {
+    setNewPostsAvailable(false);
+    try {
+      const q = buildBaseQuery(cat);
+      const snap = await getDocs(q);
       const now = Date.now();
       const docs = snap.docs;
       const items = docs.slice(0, PAGE_SIZE)
@@ -2238,10 +2130,38 @@ function Feed({ currentUser, isAdmin, theme, toggleTheme, maintenanceMode }) {
       setFirstDoc(docs[0] || null);
       setLastDoc(docs[PAGE_SIZE - 1] || null);
       setHasOlder(docs.length > PAGE_SIZE);
-      setLoading(false);
-    }, () => setLoading(false));
-    return () => unsub();
+      // Remember the newest post's timestamp so we can detect new posts
+      if (docs[0]) latestPostCreatedAt.current = docs[0].data().createdAt;
+    } finally { setLoading(false); }
   }, [activeCategory, buildBaseQuery]);
+
+  // Initial load and reload when category changes
+  useEffect(() => { fetchFeed(activeCategory); }, [activeCategory, fetchFeed]);
+
+  // Poll every 60s to check if new posts arrived — much cheaper than onSnapshot
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      try {
+        const q = query(
+          collection(db, "posts"),
+          where("deleted", "==", false),
+          ...(activeCategory ? [where("category", "==", activeCategory)] : []),
+          orderBy("createdAt", "desc"),
+          limit(1)
+        );
+        const snap = await getDocs(q);
+        if (snap.docs.length > 0 && latestPostCreatedAt.current) {
+          const newest = snap.docs[0].data().createdAt;
+          // Compare timestamps — if newer post exists, show the refresh banner
+          if (newest && latestPostCreatedAt.current &&
+              newest.seconds > latestPostCreatedAt.current.seconds) {
+            setNewPostsAvailable(true);
+          }
+        }
+      } catch (_) {}
+    }, 60000); // check every 60 seconds — costs 1 read per user per minute
+    return () => clearInterval(interval);
+  }, [activeCategory]);
 
   // ── Load OLDER posts (next page going back in time) ─────────────────────────
   const loadOlderPosts = async () => {
@@ -2267,44 +2187,37 @@ function Feed({ currentUser, isAdmin, theme, toggleTheme, maintenanceMode }) {
     } finally { setLoadingMore(false); }
   };
 
-  // ── Load NEWER posts (previous page going forward in time) ──────────────────
+  // ── Load NEWER posts (go forward in time toward page 1) ────────────────────
   const loadNewerPosts = async () => {
     if (!firstDoc || loadingMore) return;
     setLoadingMore(true);
     try {
-      // Query in ascending order from firstDoc to get posts newer than current page
+      const now = Date.now();
+      // Query ascending starting after firstDoc — gives posts newer than current page
       let q;
       if (activeCategory) q = query(collection(db, "posts"), where("deleted", "==", false), where("category", "==", activeCategory), orderBy("createdAt", "asc"), startAfter(firstDoc), limit(PAGE_SIZE + 1));
       else q = query(collection(db, "posts"), where("deleted", "==", false), orderBy("createdAt", "asc"), startAfter(firstDoc), limit(PAGE_SIZE + 1));
       const snap = await getDocs(q);
-      const now = Date.now();
-      const docs = snap.docs.reverse(); // flip back to newest-first
-      const items = docs.slice(0, PAGE_SIZE)
-        .map(d => ({ id: d.id, ...d.data() }))
-        .filter(p => !p.disappearing || (now - (p.createdAt?.toDate?.()?.getTime?.() || 0)) < DISAPPEAR_MS);
-      if (items.length === 0) {
-        // Already at the newest page — reload from top
-        const fresh = buildBaseQuery(activeCategory);
-        const freshSnap = await getDocs(fresh);
-        const freshDocs = freshSnap.docs;
-        const freshItems = freshDocs.slice(0, PAGE_SIZE)
+      const rawDocs = snap.docs;
+
+      if (rawDocs.length === 0) {
+        // Already at the newest page — just reload from top fresh
+        await fetchFeed(activeCategory);
+      } else {
+        // rawDocs: oldest → newest (asc). Reverse → newest → oldest for display.
+        const hasEvenNewer = rawDocs.length > PAGE_SIZE;
+        const pageDocs = rawDocs.slice(0, PAGE_SIZE).reverse();
+        const items = pageDocs
           .map(d => ({ id: d.id, ...d.data() }))
           .filter(p => !p.disappearing || (now - (p.createdAt?.toDate?.()?.getTime?.() || 0)) < DISAPPEAR_MS);
-        setPosts(freshItems);
-        setFirstDoc(freshDocs[0] || null);
-        setLastDoc(freshDocs[PAGE_SIZE - 1] || null);
-        setHasOlder(freshDocs.length > PAGE_SIZE);
-        setHasNewer(false);
-        setPageNum(1);
-      } else {
         setPosts(items);
-        setFirstDoc(docs[0] || null);
-        setLastDoc(docs[Math.min(PAGE_SIZE - 1, docs.length - 1)] || null);
+        setFirstDoc(pageDocs[0] || null);              // newest doc on this page
+        setLastDoc(pageDocs[pageDocs.length - 1] || null); // oldest doc on this page
+        setHasNewer(hasEvenNewer);
         setHasOlder(true);
-        setHasNewer(docs.length > PAGE_SIZE);
         setPageNum(n => Math.max(1, n - 1));
+        window.scrollTo({ top: 0, behavior: "smooth" });
       }
-      window.scrollTo({ top: 0, behavior: "smooth" });
     } finally { setLoadingMore(false); }
   };
 
@@ -2474,11 +2387,33 @@ function Feed({ currentUser, isAdmin, theme, toggleTheme, maintenanceMode }) {
               </div>
             ))}
 
-            <ComposePost currentUser={currentUser} allCategories={allCategories} bannedWords={bannedWords} />
-            <div className="section-tabs">
-              {[["latest","Latest"],["trending","🔥 Trending"],["mostCommented","💬 Most Discussed"]].map(([id, label]) =>
-                <button key={id} className={`section-tab ${section === id ? "active" : ""}`} onClick={() => setSection(id)}>{label}</button>
-              )}
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 0 }}>
+              <div className="section-tabs" style={{ flex: 1, marginBottom: 0 }}>
+                {[["latest","Latest"],["trending","🔥 Trending"],["mostCommented","💬 Most Discussed"]].map(([id, label]) =>
+                  <button key={id} className={`section-tab ${section === id ? "active" : ""}`} onClick={() => setSection(id)}>{label}</button>
+                )}
+              </div>
+              <button
+                onClick={() => fetchFeed(activeCategory)}
+                disabled={loading}
+                title="Refresh posts"
+                style={{
+                  flexShrink: 0,
+                  background: "var(--surface2)",
+                  border: "1px solid var(--border)",
+                  borderRadius: "var(--radius-sm)",
+                  color: "var(--muted)",
+                  cursor: loading ? "not-allowed" : "pointer",
+                  padding: "6px 10px",
+                  fontSize: 15,
+                  lineHeight: 1,
+                  transition: "color 0.2s, border-color 0.2s",
+                }}
+                onMouseEnter={e => e.currentTarget.style.color = "var(--accent)"}
+                onMouseLeave={e => e.currentTarget.style.color = "var(--muted)"}
+              >
+                {loading ? "⏳" : "🔄"}
+              </button>
             </div>
             {section === "latest" && (
               <div className="tabs" style={{ marginBottom: 16 }}>
@@ -2504,6 +2439,45 @@ function Feed({ currentUser, isAdmin, theme, toggleTheme, maintenanceMode }) {
               );
               return (
                 <>
+                  {/* Sponsored ad — shown at top of feed if one is approved */}
+                  {sponsoredAd && (
+                    <div style={{
+                      background: "var(--surface)",
+                      border: "1px solid rgba(124,58,237,0.35)",
+                      borderRadius: "var(--radius)",
+                      padding: "14px 16px",
+                      marginBottom: 16,
+                    }}>
+                      <div style={{ fontSize: 10, color: "var(--accent)", fontWeight: 700, letterSpacing: 1, marginBottom: 8, textTransform: "uppercase" }}>
+                        Sponsored
+                      </div>
+                      <p style={{ fontSize: 15, lineHeight: 1.6, marginBottom: 10, color: "var(--text)" }}>{sponsoredAd.adText}</p>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+                        <span style={{ fontSize: 13, color: "var(--muted)" }}>📌 {sponsoredAd.businessName}</span>
+                        {sponsoredAd.link && (
+                          <a href={sponsoredAd.link} target="_blank" rel="noopener noreferrer"
+                             style={{ fontSize: 13, color: "var(--accent)", textDecoration: "none", fontWeight: 600 }}>
+                            Learn more →
+                          </a>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                  {/* New posts banner — shows when polling detects new content */}
+                  {newPostsAvailable && (
+                    <button
+                      onClick={() => fetchFeed(activeCategory)}
+                      style={{
+                        width: "100%", marginBottom: 12, padding: "10px",
+                        background: "var(--accent)", color: "#fff", border: "none",
+                        borderRadius: "var(--radius-sm)", cursor: "pointer",
+                        fontFamily: "var(--font-body)", fontWeight: 600, fontSize: 13,
+                        display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+                      }}
+                    >
+                      ✨ New posts available — tap to refresh
+                    </button>
+                  )}
                   {/* ↑ Load newer — at the TOP, mobile-friendly */}
                   {hasNewer && (
                     <button className="btn btn-ghost" style={{ width: "100%", justifyContent: "center", marginBottom: 12 }}
@@ -2531,6 +2505,101 @@ function Feed({ currentUser, isAdmin, theme, toggleTheme, maintenanceMode }) {
         </div>
       )}
       {openPost && <PostModal post={openPost} currentUser={currentUser} onClose={() => setOpenPost(null)} allCategories={allCategories} bannedWords={bannedWords} isAdmin={isAdmin} />}
+      {/* Floating Compose Button — bottom left */}
+      <button
+        onClick={() => setComposeOpen(true)}
+        title="Write a post"
+        style={{
+          position: "fixed", bottom: 24, left: 24,
+          background: "var(--accent)", color: "#fff",
+          border: "none", borderRadius: 99,
+          width: 56, height: 56,
+          fontSize: 24, cursor: "pointer", zIndex: 998,
+          display: "flex", alignItems: "center", justifyContent: "center",
+          boxShadow: "0 4px 20px var(--glow)",
+          transition: "transform 0.15s",
+        }}
+        onMouseEnter={e => { e.currentTarget.style.transform = "scale(1.08)"; }}
+        onMouseLeave={e => { e.currentTarget.style.transform = "scale(1)"; }}
+      >
+        ✏️
+      </button>
+
+      {/* Donate — smaller floating button, bottom right */}
+      <a
+        href="https://paystack.shop/pay/donatetowhispr-app"
+        target="_blank"
+        rel="noopener noreferrer"
+        title="Support Whispr"
+        style={{
+          position: "fixed", bottom: 24, right: 24,
+          background: "#FFDD00", color: "#000",
+          borderRadius: 99, padding: "8px 14px",
+          fontWeight: 700, fontSize: 12,
+          textDecoration: "none", zIndex: 998,
+          display: "flex", alignItems: "center", gap: 5,
+          boxShadow: "0 4px 16px rgba(0,0,0,0.25)",
+          transition: "transform 0.15s",
+        }}
+        onMouseEnter={e => { e.currentTarget.style.transform = "scale(1.05)"; }}
+        onMouseLeave={e => { e.currentTarget.style.transform = "scale(1)"; }}
+      >
+        ☕ Donate
+      </a>
+
+      {/* Compose Bottom Sheet */}
+      {composeOpen && (
+        <div
+          onClick={e => { if (e.target === e.currentTarget) setComposeOpen(false); }}
+          style={{
+            position: "fixed", inset: 0,
+            background: "rgba(0,0,0,0.6)",
+            zIndex: 999,
+            display: "flex", alignItems: "flex-end", justifyContent: "center",
+          }}
+        >
+          <div style={{
+            width: "100%", maxWidth: 680,
+            background: "var(--surface)",
+            borderRadius: "20px 20px 0 0",
+            padding: "0 0 24px 0",
+            boxShadow: "0 -8px 40px rgba(0,0,0,0.4)",
+            animation: "slideUp 0.25s ease",
+            maxHeight: "90vh", overflowY: "auto",
+          }}>
+            <div style={{
+              display: "flex", alignItems: "center", justifyContent: "space-between",
+              padding: "16px 20px 8px",
+              borderBottom: "1px solid var(--border)",
+            }}>
+              <span style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: 15 }}>New Post</span>
+              <button
+                onClick={() => setComposeOpen(false)}
+                style={{
+                  background: "var(--surface3)", border: "none", borderRadius: "50%",
+                  width: 30, height: 30, cursor: "pointer", color: "var(--text)",
+                  fontSize: 14, display: "flex", alignItems: "center", justifyContent: "center",
+                }}
+              >✕</button>
+            </div>
+            <div style={{ padding: "0 4px" }}>
+              <ComposePost
+                currentUser={currentUser}
+                allCategories={allCategories}
+                bannedWords={bannedWords}
+                onNewPost={(post) => {
+                  setPosts(prev => [post, ...prev.filter(p => p.id !== post.id)]);
+                  setNewPostsAvailable(false);
+                  latestPostCreatedAt.current = post.createdAt;
+                  setComposeOpen(false);
+                }}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
+      <PushToast toast={pushToast} />
     </div>
   );
 }
@@ -2597,6 +2666,7 @@ export default function App() {
               setProfile(data);
             }
             setBanMessage(null); // Instantly lets them back in if admin unbans while active
+            registerForPushNotifications(); // request push permission silently after login
           }
           setLoading(false);
         });
@@ -2757,6 +2827,12 @@ service cloud.firestore {
     match /deviceBans/{id} {
       allow read: if isSignedIn();
       allow write: if isAdmin();
+    }
+    match /ads/{id} {
+      allow read: if isAdmin() || resource.data.status == "approved";
+      allow create: if true; // public — anyone can submit
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
     }
   }
 }
